@@ -58,7 +58,7 @@ fi
 
 release_sha=${1:-}
 repo=/opt/cloud-harness-mcp/repo
-origin=https://github.com/bestagentkits/cloud-harness-mcp.git
+origin=https://github.com/inspireui/cloud-harness-mcp.git
 install -d -m 0700 "$state/state" "$state/backups"
 install -d -m 0750 "$state/jobs" "$state/artifacts"
 env_file=/etc/cloud-harness-mcp/runtime.env

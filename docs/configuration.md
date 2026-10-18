@@ -241,6 +241,15 @@ stop a fast-running process between checks. Operate with disk monitoring and a
 host reserve; use quota-backed dedicated storage before treating this as an
 untrusted service.
 
+`GIT_HELPER_TIMEOUT_MS` (default `120000`, 30000 to 3600000), `GIT_HELPER_MEMORY_MB`
+(default `512`) and `GIT_HELPER_CPUS` (default `1`) bound the ephemeral clone, transfer
+(fetch, pull, push), and repository-cache helpers. The defaults fit ordinary repositories;
+a repository whose single-commit checkout is gigabytes in size needs a longer deadline and
+usually more memory to index its pack. The helpers stay credential-isolated, read-only,
+and network-scoped at any size. `FIREWALL_ATTESTATION_TIMEOUT_MS` (default `15000`) bounds
+the host-firewall probe container; a host saturated by a large clone can otherwise time
+the probe out and quarantine a workspace for apparent policy drift.
+
 `JOBS_ROOT` contains ephemeral workspace directories. `STATE_DB` points to
 SQLite control metadata. `ARTIFACT_ROOT` contains retained, bounded dashboard
 snapshots and spooled task outputs; it must use runner-confined durable storage

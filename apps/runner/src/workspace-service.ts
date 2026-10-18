@@ -381,7 +381,9 @@ export class WorkspaceService {
       });
     };
     this.networkProfileManager = new NetworkProfileManager(this.config);
-    this.repoCacheManager = new RepositoryCacheManager(this.config.repoCacheRoot, this.store, this.config.allowedGitHosts, this.config.executorImage, this.instanceId);
+    this.repoCacheManager = new RepositoryCacheManager(this.config.repoCacheRoot, this.store, this.config.allowedGitHosts, this.config.executorImage, this.instanceId, {
+      timeoutMs: this.config.gitHelperTimeoutMs, memoryMb: this.config.gitHelperMemoryMb, cpus: this.config.gitHelperCpus
+    });
     const cacheRoot = this.config.toolkitCacheRoot || (this.config.jobsRoot && !this.config.jobsRoot.startsWith('/var/lib') ? join(this.config.jobsRoot, 'toolkit-cache') : '/var/lib/cloud-harness/cache/toolkits');
     const provNet = this.config.provisioningNetwork || 'cloud-harness-mcp_provisioning';
     this.toolkitCacheManager = new ToolkitCacheManager(cacheRoot, this.store);
@@ -816,6 +818,12 @@ export class WorkspaceService {
     return Math.min(record.hardExpiresAt, activityAt + (record.idleTtlSeconds ?? this.config.idleTtlSeconds) * 1_000);
   }
 
+  /** Memory and CPU bounds shared by the ephemeral clone and transfer helpers (`GIT_HELPER_MEMORY_MB`, `GIT_HELPER_CPUS`). */
+  private gitHelperResourceArgs(): string[] {
+    const memory = `${this.config.gitHelperMemoryMb}m`;
+    return ['--memory', memory, '--memory-swap', memory, '--cpus', String(this.config.gitHelperCpus)];
+  }
+
   private async clone(record: WorkspaceRecord, repositoryUrl: URL, ref?: string, historySpec = ''): Promise<string> {
     const jobPath = record.workspacePath;
     const repositoryPath = join(jobPath, 'repo');
@@ -840,7 +848,7 @@ export class WorkspaceService {
       '--label', `cloud-harness.instance=${this.instanceId}`,
       '--label', `cloud-harness.workspace=${record.id}`, '--network', 'bridge', '--user', '10001:10001',
       '--read-only', '--tmpfs', '/tmp:rw,exec,nosuid,nodev,size=64m', '--cap-drop', 'ALL',
-      '--security-opt', 'no-new-privileges', '--pids-limit', '128', '--memory', '512m', '--memory-swap', '512m', '--cpus', '1',
+      '--security-opt', 'no-new-privileges', '--pids-limit', '128', ...this.gitHelperResourceArgs(),
       '--env', 'HOME=/tmp/cloud-harness-home', '--env', 'GIT_CONFIG_NOSYSTEM=1', '--env', 'GIT_TERMINAL_PROMPT=0',
       '--volume', `${jobPath}:/job`,
       ...(cachePath ? ['--volume', `${cachePath}:/job/cache:ro`] : []),
@@ -850,7 +858,7 @@ export class WorkspaceService {
 
     const runClone = async (token: string | undefined, cachePath?: string) => {
       try {
-        return await runDocker(buildArgs(cachePath), { stdin: `${token ?? ''}\n`, timeoutMs: 120_000, maxBytes: this.config.maxOutputBytes });
+        return await runDocker(buildArgs(cachePath), { stdin: `${token ?? ''}\n`, timeoutMs: this.config.gitHelperTimeoutMs, maxBytes: this.config.maxOutputBytes });
       } finally {
         await removeContainer(helperName);
       }
@@ -1918,12 +1926,12 @@ export class WorkspaceService {
         '--label', `cloud-harness.instance=${this.instanceId}`, '--label', `cloud-harness.workspace=${record.id}`,
         '--network', network, '--user', '10001:10001', '--read-only',
         '--tmpfs', '/tmp:rw,exec,nosuid,nodev,size=64m', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
-        '--pids-limit', '128', '--memory', '512m', '--memory-swap', '512m', '--cpus', '1',
+        '--pids-limit', '128', ...this.gitHelperResourceArgs(),
         '--env', 'HOME=/tmp/cloud-harness-home', '--env', 'GIT_CONFIG_NOSYSTEM=1', '--env', 'GIT_TERMINAL_PROMPT=0',
         '--volume', `${record.workspacePath}:/job:rw`, '--entrypoint', '/opt/harness/git-transfer-helper.sh',
         this.config.executorImage, mode, record.repositoryUrl, '/job/repo', `/job/${transferName}`, argument, expectedRemoteOid ?? '', historySpec
       ], {
-        stdin: `${token ?? ''}\n`, timeoutMs: 120_000, maxBytes: this.config.maxOutputBytes,
+        stdin: `${token ?? ''}\n`, timeoutMs: this.config.gitHelperTimeoutMs, maxBytes: this.config.maxOutputBytes,
         ...(signal ? { signal } : {})
       });
       if (result.exitCode !== 0) {

@@ -14,7 +14,8 @@ export class NetworkProfileManager {
       bridgeSubnet: config.dependencyBridgeSubnet,
       dnsResolvers: config.dependencyDnsResolvers,
       networkGuardImage: config.networkGuardImage,
-      executorImage: config.executorImage
+      executorImage: config.executorImage,
+      attestationTimeoutMs: config.firewallAttestationTimeoutMs
     });
   }
   public async ensureProfileReady(profile: ExecutorNetworkProfile): Promise<void> {

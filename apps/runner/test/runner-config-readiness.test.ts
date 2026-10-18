@@ -75,3 +75,35 @@ describe('Cloudflare Access Managed OAuth control-plane configuration', () => {
     expect(() => loadRunnerConfigWithReadiness()).toThrow(/only valid in cloudflare-access mode/);
   });
 });
+
+describe('Git helper and firewall attestation bounds', () => {
+  it('keeps the shipped defaults when nothing is configured', () => {
+    requiredEnvironment();
+    expect(loadRunnerConfigWithReadiness().config).toMatchObject({
+      gitHelperTimeoutMs: 120_000,
+      gitHelperMemoryMb: 512,
+      gitHelperCpus: 1,
+      firewallAttestationTimeoutMs: 15_000
+    });
+  });
+
+  it('reads larger bounds for repositories that need more time to clone', () => {
+    requiredEnvironment();
+    vi.stubEnv('GIT_HELPER_TIMEOUT_MS', '900000');
+    vi.stubEnv('GIT_HELPER_MEMORY_MB', '2048');
+    vi.stubEnv('GIT_HELPER_CPUS', '2');
+    vi.stubEnv('FIREWALL_ATTESTATION_TIMEOUT_MS', '60000');
+    expect(loadRunnerConfigWithReadiness().config).toMatchObject({
+      gitHelperTimeoutMs: 900_000,
+      gitHelperMemoryMb: 2048,
+      gitHelperCpus: 2,
+      firewallAttestationTimeoutMs: 60_000
+    });
+  });
+
+  it('refuses a Git helper timeout below the supported floor', () => {
+    requiredEnvironment();
+    vi.stubEnv('GIT_HELPER_TIMEOUT_MS', '1000');
+    expect(() => loadRunnerConfigWithReadiness()).toThrow();
+  });
+});

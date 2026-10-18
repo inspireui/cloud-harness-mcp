@@ -276,6 +276,13 @@ export const RunnerConfigSchema = z.object({
   packagesMaxOwnerBytes: z.coerce.number().int().min(67_108_864).max(68_719_476_736).default(4_294_967_296),
   packagesMaxBindings: z.coerce.number().int().min(1).max(256).default(32),
   packagesBuildTimeoutMs: z.coerce.number().int().min(60_000).max(1_800_000).default(600_000),
+  // Ephemeral Git helpers (workspace clone, fetch/pull/push transfer, repository cache mirror). The defaults
+  // fit ordinary repositories; a large one needs more time, memory, or CPU to download and index its pack.
+  gitHelperTimeoutMs: z.coerce.number().int().min(30_000).max(3_600_000).default(120_000),
+  gitHelperMemoryMb: z.coerce.number().int().min(256).max(16_384).default(512),
+  gitHelperCpus: z.coerce.number().min(0.25).max(16).default(1),
+  // Bounds the host-firewall probe container; a host busy with a large clone can need longer than the default.
+  firewallAttestationTimeoutMs: z.coerce.number().int().min(5_000).max(300_000).default(15_000),
   minFreeBytes: z.coerce.number().int().min(104_857_600).default(2_147_483_648),
   maxWorkspaceBytes: z.coerce.number().int().min(104_857_600).default(2_147_483_648),
   maxActiveWorkspacesPerOwner: z.coerce.number().int().min(1).max(64).default(DEFAULT_MAX_ACTIVE_WORKSPACES_PER_OWNER),

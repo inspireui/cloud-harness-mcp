@@ -20,7 +20,8 @@ export class RepositoryCacheManager {
     private readonly store: StateStore,
     private readonly allowedGitHosts: string[],
     private readonly executorImage: string = 'cloud-harness-executor:local',
-    private readonly instanceId: string = 'local'
+    private readonly instanceId: string = 'local',
+    private readonly helperLimits: { timeoutMs: number; memoryMb: number; cpus: number } = { timeoutMs: 120_000, memoryMb: 512, cpus: 1 }
   ) {}
 
   getCachePath(ownerId: string, repositoryUrl: string): string {
@@ -96,7 +97,8 @@ esac
         '--label', `cloud-harness.instance=${this.instanceId}`,
         '--network', network, '--user', '10001:10001', '--read-only',
         '--tmpfs', '/tmp:rw,exec,nosuid,nodev,size=64m', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
-        '--pids-limit', '128', '--memory', '512m', '--memory-swap', '512m', '--cpus', '1',
+        '--pids-limit', '128', '--memory', `${this.helperLimits.memoryMb}m`, '--memory-swap', `${this.helperLimits.memoryMb}m`,
+        '--cpus', String(this.helperLimits.cpus),
         '--env', 'HOME=/tmp/cloud-harness-home', '--env', 'GIT_CONFIG_NOSYSTEM=1', '--env', 'GIT_TERMINAL_PROMPT=0',
         ...proxyEnvs,
         '--volume', `${ownerDir}:/cache`,
@@ -114,7 +116,7 @@ git -c http.followRedirects=false -c core.hooksPath=/dev/null clone --mirror --b
         'cache-helper', repositoryUrl, urlHash
       ], {
         stdin: `${token ?? ''}\n`,
-        timeoutMs: 120_000,
+        timeoutMs: this.helperLimits.timeoutMs,
         maxBytes: 1_048_576,
         ...(signal ? { signal } : {})
       });

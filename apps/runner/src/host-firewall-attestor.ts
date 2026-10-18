@@ -13,6 +13,7 @@ export type HostFirewallAttestorConfig = {
   dnsResolvers?: string[];
   networkGuardImage?: string;
   executorImage?: string;
+  attestationTimeoutMs?: number;
 };
 
 export class HostFirewallAttestor {
@@ -21,6 +22,7 @@ export class HostFirewallAttestor {
   public readonly bridgeSubnet: string;
   public readonly dnsResolvers: string[];
   public readonly networkGuardImage: string;
+  public readonly attestationTimeoutMs: number;
 
   constructor(config: HostFirewallAttestorConfig = {}) {
     this.networkName = config.networkName ?? 'cloud-harness-dependency-access';
@@ -28,6 +30,7 @@ export class HostFirewallAttestor {
     this.bridgeSubnet = config.bridgeSubnet ?? '172.30.240.0/24';
     this.dnsResolvers = config.dnsResolvers && config.dnsResolvers.length > 0 ? config.dnsResolvers : ['8.8.8.8', '1.1.1.1'];
     this.networkGuardImage = config.networkGuardImage ?? 'cloud-harness-network-guard:local';
+    this.attestationTimeoutMs = config.attestationTimeoutMs ?? 15_000;
   }
 
   public verifyDockerNetwork(networkInspect: Record<string, unknown> | undefined): { ok: boolean; reason?: string } {
@@ -287,7 +290,7 @@ export class HostFirewallAttestor {
         '--security-opt', 'no-new-privileges',
         '--user', '0:0',
         this.networkGuardImage
-      ], { timeoutMs: 15_000 });
+      ], { timeoutMs: this.attestationTimeoutMs });
 
       if (result.exitCode !== 0) {
         return { ok: false, reason: `host firewall probe failed (exit code ${result.exitCode}): ${result.stderr || result.stdout}` };

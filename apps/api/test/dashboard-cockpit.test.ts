@@ -74,6 +74,14 @@ describe('workspace cockpit', () => {
     expect(unavailable).toContain('temporary checkout has already been cleaned up');
   });
 
+  it('labels an expired recoverable workspace instead of reporting it as unknown', () => {
+    const expired = { ...base, status: 'EXPIRED_RECOVERABLE' };
+    const header = renderWorkspaceCockpitHeader(expired);
+    expect(header).toContain('Expired (recoverable)');
+    expect(header).toContain('class="status expired_recoverable"');
+    expect(header).not.toContain('>Unknown<');
+  });
+
   it('derives lease emphasis from thresholds rather than decoration', () => {
     const now = Date.parse('2026-08-17T00:00:00.000Z');
     expect(workspaceLeaseState({ expiresAt: '2026-08-17T00:00:00.000Z' }, now).state).toBe('expired');

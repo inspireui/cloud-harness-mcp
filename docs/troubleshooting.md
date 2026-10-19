@@ -51,6 +51,9 @@ URLs, or raw command content into tickets or shared logs.
 | Local `--workspace-config`: `failed to load --workspace-config` at startup | The file or a root failed validation: unknown field, duplicate key, alias, invalid name, wrong `version`, or a root that is missing, not a directory, or overlaps another root. Fix the named entry; the server never starts with a partial registry. |
 | Local multi-workspace: `CONFLICT` ... `pass workspaceId explicitly` | More than one root is registered and the call named none. Call `workspace_list` and pass the `workspaceId`; over stdio, `workspace_set_active` can set a default. |
 | Local multi-workspace: retryable `UNAVAILABLE` ... `root ... is unavailable`, or `rootAvailable: false` | The root disappeared or was replaced since startup (for example a dropped NFS mount). Restore the mount, then retry; do not repoint the path at another directory, which changes the root's identity. |
+| Local HTTP: `429 rate_limited` or `413` (`PayloadTooLargeError` in the journal) | Every local client is the same owner and shares `http.limits` (default 600 requests/min, 32 in flight, 4 MiB body). Raise `requestsPerMinute`, `inFlight`, or `maxBodyBytes` in the registry and restart, and move large files with `exec_run` (for example `curl`) instead of `files_write`. |
+| Local: a task reports `interrupted`, or an operation `RUNNER_RESTARTED` | The server restarted while it ran; only its metadata survived (`stateDir`). Start it again with a new `idempotencyKey`. |
+| Local: `workspace_close` returned `shared: true` and nothing stopped | Registered roots are shared by every client, so close is a no-op. Cancel your own work with `tasks_cancel`, `operation_cancel`, `shell_close`, or `sessions_close`. |
 | Local HTTP: `local HTTP mode requires MCP_BEARER_TOKEN` | `--transport http --workspace-config` needs a 32-512 character, non-placeholder token in `MCP_BEARER_TOKEN` or `MCP_BEARER_TOKEN_FILE`. |
 
 The request policy is owned by

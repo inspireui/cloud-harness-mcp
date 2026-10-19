@@ -926,9 +926,9 @@ command, repository, network mode, or workspace changes.
 When running Cloud Harness MCP over local stdio (`--transport stdio --workspace <path>`):
 
 1. **Pre-opened workspace:** The workspace is configured at process startup. Calling `workspace_open` returns `INVALID_INPUT` explaining that the workspace is already selected.
-2. **Lifecycle operations:** `workspace_list` lists the active local workspace. `workspace_status` and `workspace_capabilities` return structured repository and workspace capabilities (`mode: 'local'`, `gitNetwork`, `gitPush`, `sandboxed: false`, granular operations and permissions). `workspace_close` terminates owned child processes but **never deletes the local folder**.
+2. **Lifecycle operations:** `workspace_list` lists the active local workspace. `workspace_status` and `workspace_capabilities` return structured repository and workspace capabilities (`mode: 'local'`, `gitNetwork`, `gitPush`, `sandboxed: false`, granular operations and permissions). `workspace_close` terminates owned child processes but **never deletes the local folder**. Tools local mode cannot serve are not listed; see [Local tool surface](#local-tool-surface).
 3. **Subprocess execution:** `exec_run`, `shell_*`, `sessions_*`, and `tasks_*` execute on the local host with the current user's permissions. Output is bounded by ring buffers and paginated with monotonic cursors.
-4. **Gated capabilities:** `git_fetch` and `git_pull` require `--git-network`. `git_push` requires `--git-push`. `github_action`, `exec_run.privileged=true`, and `bash` with `target: "toolbox"` return structured unsupported errors; `bash` with `target: "workspace"` behaves like `exec_run`.
+4. **Gated capabilities:** `git_fetch` requires `--git-network`. `git_pull` and `git_push` stay behind `--git-network`/`--git-push`, and when allowed point to running `git` through `exec_run`. `github_action`, `exec_run.privileged=true`, and `bash` with `target: "toolbox"` return structured unsupported errors; `bash` with `target: "workspace"` behaves like `exec_run`, including `async: true`.
 5. **Filesystem operations:** File reading, writing, patching, deletion, and searching apply within the canonical workspace root. Traversal escapes are rejected.
 
 ### Local multi-workspace mode
@@ -961,10 +961,54 @@ output never cross roots. The file format and client setup are in the
   stuck mount never blocks the other roots. `workspace_status` and
   `workspace_close` still work so a client can inspect and stop it; a closed root
   reports `status: CLOSED` with `workspace_recover` as its next action.
-- **Close and recover.** `workspace_close` stops that root's processes and never
-  touches its files; `workspace_recover` reopens a closed root with the same ID.
-- **Unchanged modes.** Single-root `--workspace` stdio and the remote
-  runner-backed HTTP service behave as before.
+- **Shared roots stay open.** Every client of the server shares a registered
+  root, so `workspace_close` is a no-op that reports `shared: true`,
+  `closed: false` and stops no task, shell, session, or operation; the root's
+  `availableActions` omit it. Only server shutdown stops a root's processes,
+  and `workspace_recover` reopens a root stopped that way with the same ID.
+  Refusing while work runs was rejected because an idle close would still break
+  every other client's next call.
+- **Long jobs.** `exec_run` and `bash` with `async: true` return
+  `{ operationId, status: "running" }` like the remote runner, and
+  `operation_status`, `operation_wait` (capped at 300 s per call), and
+  `operation_cancel` resolve that handle in the root that started it. Statuses
+  are `running`, `completed`, `failed`, and `cancelled`; the result is the
+  synchronous call's `data` (`output`, `exitCode`, `truncated`, and for `bash`
+  `target`). An async command keeps its newest `maxOutputBytes` of output
+  instead of stopping at the limit. `tasks_run` with `tasks_status` remains the
+  path for jobs longer than 300 s.
+- **Restarts.** With the registry's `stateDir` (default
+  `~/.local/state/cloud-harness-local`), task and operation metadata (ID, key,
+  command, cwd, status, exit code, start and end times; never output) is
+  rewritten atomically on every change. After a restart, a task that was
+  running or queued reports `interrupted` and an operation reports `failed` with
+  `RUNNER_RESTARTED` instead of `NOT_FOUND`. Its idempotency key still returns
+  that handle, so a restart never re-runs a command on its own; retry with a new
+  key.
+- **Request limits.** `http.limits` sets the owner's `requestsPerMinute`
+  (default 600), `inFlight` (32), and `maxBodyBytes` (4 MiB). Every local
+  client authenticates as the same owner and shares these.
+- **Unchanged modes.** Single-root `--workspace` stdio keeps its
+  close-stops-processes semantics and in-memory tasks, and the remote
+  runner-backed HTTP service behaves as before.
+
+### Local tool surface
+
+Local servers (single-root and multi-root) leave out of `tools/list` every tool
+they cannot serve, and refuse a call that names one anyway with
+`INVALID_INPUT` naming the local alternative, never a generic worker error:
+`agent_*` (start a CLI agent with `tasks_run`), `knowledge_*`, `artifacts_*`,
+`packages_*`, model tools, `secrets_list`, `workspace_open`,
+`workspace_finalize`, `git_identity_*`, `skill_suggest`, `git_pull` and
+`git_push` (run `git` through `exec_run`; the `--git-network`/`--git-push`
+gates still answer first when off), `workspace_set_active` except on
+multi-root stdio, and `worktrees_*` when no registered root is inside a Git
+work tree. `github_read` and `github_action` keep their structured
+`REPOSITORY_OPERATION_NOT_AUTHORIZED` error and name the `gh` CLI. Each tool
+call writes one JSON line to stderr with `tool`, `workspaceId`, `durationMs`,
+and `outcome` (plus the error `code`), and never arguments or output. The list
+is owned by
+[`local-unsupported.ts`](../apps/api/src/local/local-unsupported.ts).
 
 The executable owners are
 [`local-workspace-registry.ts`](../apps/api/src/local/local-workspace-registry.ts),

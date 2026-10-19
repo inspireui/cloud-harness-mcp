@@ -124,7 +124,9 @@ In local mode:
 
 - The configured folder behaves as an already-opened workspace (with an opaque `workspaceId`). `workspace_open` is not required.
 - File operations, patches, grep search, symbol search, sessions, tasks, and local Git tools operate directly on the folder.
-- `workspace_close` terminates owned child processes and tasks but **never deletes your local project folder**.
+- `workspace_close` terminates owned child processes and tasks but **never deletes your local project folder**. With `--workspace-config`, folders are shared by every client and `workspace_close` is a no-op.
+- `exec_run` and `bash` accept `async: true` and return an operation handle for `operation_wait`; `tasks_run` runs longer jobs.
+- Only tools local mode can serve are listed; remote-only tools (agents, knowledge, artifacts, packages, model profiles, `github_*`) are left out, and a call to one names the local alternative.
 - Tool paths and working directories are strictly confined within the workspace root.
 - Commands (`exec_run`, shells, tasks) execute with host-user permissions. File path confinement is not an OS sandbox.
 - Network Git (`git_fetch`, `git_pull`) and Git push (`git_push`) are disabled by default and require explicit startup opt-in flags (`--git-network`, `--git-push`).
@@ -134,7 +136,9 @@ To serve several persistent project folders from one process, register them in
 a versioned YAML/JSON file and pass `--workspace-config <absolute-path>` instead
 of `--workspace`. It works over stdio, or over `--transport http` as an
 authenticated local endpoint that needs no Docker runner. Each folder keeps its
-own path confinement, processes, and stable `workspaceId`. See
+own path confinement, processes, and stable `workspaceId`. The file can also
+set `http.limits` (requests per minute, in-flight requests, body size) and a
+`stateDir` where task records survive restarts. See
 [Several local workspaces from one server](docs-site/connect.md#several-local-workspaces-from-one-server)
 for the file format and client setup, and [MCP usage](docs/mcp-api.md#local-multi-workspace-mode)
 for selection and failure semantics.

@@ -60,7 +60,7 @@ In addition to remote Streamable HTTP, Cloud Harness MCP can run locally over **
 cloud-harness-mcp --transport stdio --workspace /absolute/path/to/project
 ```
 
-Local mode exposes the full tool surface directly to the local folder with host-user authority. Closing the workspace terminates processes without deleting the project folder.
+Local mode exposes the local tool surface directly to the local folder with host-user authority; tools that need the remote runner (agents, knowledge, artifacts, packages, model profiles, the GitHub broker) are not listed. Closing the workspace terminates processes without deleting the project folder.
 
 ### Several local workspaces from one server
 
@@ -78,9 +78,14 @@ workspaces:
     path: /mnt/volumes/web
     gitNetwork: true   # optional per-workspace override of --git-network
     gitPush: false     # optional per-workspace override of --git-push
+stateDir: /var/lib/cloud-harness-local   # optional; default ~/.local/state/cloud-harness-local
 http:                  # optional; used only with --transport http
   host: 127.0.0.1
   port: 3100
+  limits:              # optional; shared by every client of this server
+    requestsPerMinute: 600
+    inFlight: 32
+    maxBodyBytes: 4194304
 ```
 
 The file is the only way to register a folder: no tool can add, move, or rename
@@ -127,9 +132,18 @@ the origin to `http.allowedOrigins`.
 
 If a folder disappears or is replaced (for example an NFS mount drops), calls to
 it fail with a retryable `UNAVAILABLE` error and `workspace_list` reports
-`rootAvailable: false` until the mount returns. `workspace_close` stops that
-folder's processes without deleting files, and `workspace_recover` reopens it
-with the same ID.
+`rootAvailable: false` until the mount returns.
+
+Registered folders are shared by every client, so `workspace_close` is a no-op
+there: it never stops another client's tasks, shells, or sessions. For work
+longer than one call (300 seconds at most), use `tasks_run` and poll
+`tasks_status`, or pass `async: true` to `exec_run` or `bash` and call
+`operation_wait`. Task records survive a restart in `stateDir`; work that was
+running then reports `interrupted`. The server lists only the tools local mode
+can serve: use the `gh` CLI through `exec_run` instead of `github_*`, and a CLI
+agent started with `tasks_run` instead of `agent_*`. Each call writes one JSON
+line (tool, workspace, duration, outcome) to stderr, which `journalctl` shows
+for a systemd service.
 
 ::: warning Host authority
 Every registered folder runs commands as the host user that started the server.

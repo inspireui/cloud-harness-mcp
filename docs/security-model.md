@@ -909,7 +909,18 @@ never for mutually untrusted users.
   ([`request-security.ts`](../apps/api/src/request-security.ts)), binds to
   loopback by default, and keeps no shared active-workspace state between
   requests. Binding it to a non-loopback address exposes host-user execution to
-  anyone holding the token.
+  anyone holding the token. Its per-owner limits and body size come from
+  `http.limits` in the registry, with higher defaults than the remote API
+  because every local client is the one owner.
+- Clients share every registered root, so `workspace_close` cannot stop another
+  client's processes: it is a no-op on a registered root.
+- Task and async-operation metadata, including the command text, is saved under
+  the registry's `stateDir` with owner-only permissions (directory `0700`, file
+  `0600`) so a restart can report interrupted work. Output is never saved. A
+  command that carries a secret on its command line therefore lands in that
+  file; pass secrets through forwarded environment variables instead.
+- The per-call log line on stderr carries the tool, workspace, duration, and
+  outcome only, never arguments or output.
 
 ## Repository capability introspection and authorization preflight
 

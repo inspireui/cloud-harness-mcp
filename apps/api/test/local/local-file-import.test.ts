@@ -143,6 +143,14 @@ describe('files_import (local)', () => {
     }
     expect(await readdir(outside)).toEqual([]);
     expect(requests).toEqual([]);
+    // A Node errno error (ENOTDIR through a dangling symlink) reports only its code, never the host path.
+    await symlink(join(base, 'missing'), join(root, 'dang'));
+    const notDir = await run({ dir: 'dang/sub', files: [ref('/png')] });
+    expect(notDir.ok).toBe(false);
+    expect(notDir.error?.code).toBe('INVALID_INPUT');
+    expect(notDir.message).toMatch(/^dir cannot be created: E[A-Z]+$/);
+    expect(JSON.stringify(notDir)).not.toContain(base);
+    expect(requests).toEqual([]);
     const badName = await run({ dir: 'out', files: [ref('/png'), ref('/jpeg')], names: ['../x.png', 'ok.jpg'] });
     expect((badName.data as Data).files.map((file) => file.ok ? file.path : file.error.code)).toEqual(['INVALID_NAME', 'out/ok.jpg']);
   });
@@ -155,6 +163,10 @@ describe('files_import (local)', () => {
     expect(kept.error?.code).toBe('CONFLICT');
     expect((kept.data as Data).files[0]).toMatchObject({ error: { code: 'EXISTS' } });
     expect(await readFile(join(root, 'out', 'hero.png'), 'utf8')).toBe('old');
+    // The clash is known from the name, so the URL is not spent; same for a file_name with an extension.
+    const byFileName = await run({ dir: 'out', files: [ref('/jpeg', { file_name: 'hero.png' })] });
+    expect((byFileName.data as Data).files[0]).toMatchObject({ error: { code: 'EXISTS' } });
+    expect(requests).toEqual([]);
 
     const replaced = await run({ dir: 'out', files: [ref('/png')], names: ['hero.png'], overwrite: true });
     expect(replaced.ok).toBe(true);
@@ -201,6 +213,16 @@ describe('files_import (local)', () => {
     const called = await rpc(call) as { result: { structuredContent: { ok: boolean; data: Data } } };
     expect(called.result.structuredContent.ok).toBe(true);
     expect(called.result.structuredContent.data.files.map((file) => file.ok ? file.path : file.error.code)).toEqual(['in/file-png.png', 'TOO_LARGE']);
+
+    // A client that sends null for the optional fields is treated as leaving them out.
+    const nulls = await fetch(`${url}/mcp`, {
+      method: 'POST',
+      headers: mcpHeaders,
+      body: JSON.stringify({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'files_import', arguments: { workspaceId, dir: 'in', files: [ref('/jpeg', { mime_type: null, file_name: null }), ref('/text', { mime_type: null })] } } })
+    });
+    const nulled = await rpc(nulls) as { result: { isError?: boolean; structuredContent: { ok: boolean; data: Data } } };
+    expect(nulled.result.isError).not.toBe(true);
+    expect(nulled.result.structuredContent.data.files.map((file) => file.ok ? file.path : file.error.code)).toEqual(['in/file-jpeg.jpg', 'in/file-text.txt']);
 
     const instructions = new MultiLocalWorkspaceBackend(pool, 'explicit').getInstructions();
     expect(instructions).toContain('call files_import with the image as a file; never paste base64');

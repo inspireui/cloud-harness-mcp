@@ -36,13 +36,16 @@ export function defaultFileImportSettings(env: NodeJS.ProcessEnv = process.env):
   return { maxFileBytes: DEFAULT_IMPORT_MAX_FILE_BYTES, allowLoopbackHttp: env[IMPORT_LOOPBACK_HTTP_ENV] === '1' };
 }
 
+/** An optional string where a client's JSON null means absent; the declared JSON Schema stays a plain string. */
+const optionalString = (schema: z.ZodString) => z.preprocess((value) => (value === null ? undefined : value), schema.optional());
+
 // The Apps SDK requires all four properties declared, download_url and file_id required. Unknown
 // properties ChatGPT may add later are accepted and ignored.
 export const FileRefSchema = z.looseObject({
   download_url: z.string().min(1).max(16_384).describe('Temporary download URL, filled in by the client'),
   file_id: z.string().min(1).max(512).describe('Client file identifier'),
-  mime_type: z.string().max(255).optional().describe('MIME type reported by the client'),
-  file_name: z.string().max(1_024).optional().describe('Original file name')
+  mime_type: optionalString(z.string().max(255)).describe('MIME type reported by the client'),
+  file_name: optionalString(z.string().max(1_024)).describe('Original file name')
 });
 export type FileRef = z.infer<typeof FileRefSchema>;
 
@@ -133,10 +136,21 @@ function sanitizeName(raw: string): string {
   return base.normalize('NFKC').replace(/[^A-Za-z0-9._-]+/g, '_').replace(/^[._]+/, '').replace(/_+/g, '_').slice(0, 128);
 }
 
+function usableFileName(ref: FileRef): string {
+  const fromName = ref.file_name ? sanitizeName(ref.file_name) : '';
+  return /[A-Za-z0-9]/.test(fromName) ? fromName : '';
+}
+
+/** The default name when it does not depend on the downloaded MIME type: a file_name with an extension. */
+function nameKnownBeforeDownload(ref: FileRef): string | undefined {
+  const fromName = usableFileName(ref);
+  return /\.[A-Za-z0-9]{1,8}$/.test(fromName) ? fromName : undefined;
+}
+
 /** Default name: the sanitized file_name, else the file_id with an extension from the MIME type. */
 function defaultName(ref: FileRef, mime: string): string {
-  const fromName = ref.file_name ? sanitizeName(ref.file_name) : '';
-  if (fromName && /[A-Za-z0-9]/.test(fromName)) {
+  const fromName = usableFileName(ref);
+  if (fromName) {
     return /\.[A-Za-z0-9]{1,8}$/.test(fromName) ? fromName : `${fromName}${EXTENSION_BY_MIME[mime] ?? ''}`;
   }
   const id = sanitizeName(ref.file_id) || 'file';
@@ -258,6 +272,9 @@ async function download(ref: FileRef, dir: string, settings: FileImportSettings,
   return { tmp, bytes, sha256: hash.digest('hex'), mime };
 }
 
+const existsError = () => new ImportError('EXISTS', 'a file with this name already exists; pass overwrite: true or another name');
+const duplicateName = (name: string) => new ImportError('DUPLICATE_NAME', `another file in this call is already named ${name}`);
+
 /** Moves the finished temporary file onto its name; without overwrite an existing name wins. */
 async function commit(tmp: string, target: string, overwrite: boolean): Promise<void> {
   try {
@@ -272,10 +289,10 @@ async function commit(tmp: string, target: string, overwrite: boolean): Promise<
       await link(tmp, target);
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
-      if (code === 'EEXIST') throw new ImportError('EXISTS', 'a file with this name already exists; pass overwrite: true or another name');
+      if (code === 'EEXIST') throw existsError();
       if (code !== 'EPERM' && code !== 'ENOTSUP' && code !== 'EOPNOTSUPP' && code !== 'EXDEV') throw error;
       // Filesystems without hard links: check, then rename.
-      if (await lstat(target).then(() => true, () => false)) throw new ImportError('EXISTS', 'a file with this name already exists; pass overwrite: true or another name');
+      if (await lstat(target).then(() => true, () => false)) throw existsError();
       await rename(tmp, target);
       return;
     }
@@ -310,7 +327,9 @@ export async function importFiles(policy: LocalPathPolicy, input: FilesImportInp
   try {
     dir = await resolveDirectory(policy, input.dir);
   } catch (error) {
-    const message = error instanceof Error && /escapes workspace|not a directory|unavailable/.test(error.message)
+    // Only the policy's own messages pass through; a Node errno message quotes the absolute host path.
+    const ownMessage = error instanceof Error && !(error as NodeJS.ErrnoException).code;
+    const message = ownMessage && /escapes workspace|not a directory|unavailable/.test(error.message)
       ? `dir ${error.message}`
       : `dir cannot be created: ${(error as NodeJS.ErrnoException).code ?? 'error'}`;
     return failure('INVALID_INPUT', message);
@@ -324,11 +343,18 @@ export async function importFiles(policy: LocalPathPolicy, input: FilesImportInp
       if (explicit !== undefined && !validName(explicit)) {
         throw new ImportError('INVALID_NAME', 'names entries must be plain file names without separators, "..", or control characters');
       }
+      // Fail before spending the short-lived URL when the name is already known to clash; commit()
+      // stays the authoritative existence check.
+      const early = explicit ?? nameKnownBeforeDownload(ref);
+      if (early !== undefined) {
+        if (claimed.has(early)) throw duplicateName(early);
+        if (!overwrite && await lstat(join(dir, early)).then(() => true, () => false)) throw existsError();
+      }
       const downloaded = await download(ref, dir, settings, signal);
       const name = explicit ?? defaultName(ref, downloaded.mime);
       if (claimed.has(name)) {
         await unlink(downloaded.tmp).catch(() => undefined);
-        throw new ImportError('DUPLICATE_NAME', `another file in this call is already named ${name}`);
+        throw duplicateName(name);
       }
       claimed.add(name);
       const target = join(dir, name);

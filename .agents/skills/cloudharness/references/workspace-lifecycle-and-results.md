@@ -33,19 +33,16 @@ operator-registered folder; no tool can add one.
   artifacts, packages, model profiles, secrets, `github_*`, `git_pull`,
   `git_push`, `git_identity_*`, `skill_suggest`, `workspace_finalize`, and
   (when no folder is a Git work tree) `worktrees_*` are left out; calling one
-  anyway fails with `Tool <name> not found` (reconnect if your tool list is
-  stale). Use the alternatives instead: the `gh` CLI or `git push` through
-  `exec_run`, or a CLI agent run with `tasks_run`.
-- Long jobs: `exec_run`/`bash` block for at most `timeoutMs` (default 60 s, at
-  most 300 s). For anything longer than 300 s use `tasks_run` with a unique
-  `idempotencyKey` and an explicit `timeoutMs`, and poll `tasks_status`.
-  `async: true` only frees the call while a command of up to 300 s runs: you get
-  an `op_` handle for `operation_wait` (at most 300 s per call) or
-  `operation_status`. Task and operation handles survive a server restart as
-  metadata only: a handle that was running reports `interrupted` (operations:
-  `failed` with `RUNNER_RESTARTED`) and its output is gone. Repeating its key in
-  `tasks_run` returns `RUNNER_RESTARTED` instead of re-running it, so start it
-  again with a new key.
+  fails with `Tool <name> not found` (reconnect if your list is stale). Use
+  `gh` or `git push` through `exec_run`, or a CLI agent run with `tasks_run`.
+- Long jobs: `exec_run`/`bash` stop at `timeoutMs` (default 60 s, max 300 s),
+  even with `async: true`, which only frees the call (`op_` handle for
+  `operation_wait`, at most 300 s per call). For anything longer use
+  `tasks_run` with a unique `idempotencyKey` and explicit `timeoutMs`, and poll
+  `tasks_status`. After a server restart a running handle reports
+  `interrupted` (operations: `failed` with `RUNNER_RESTARTED`), its output is
+  gone, and repeating its key in `tasks_run` returns `RUNNER_RESTARTED`: start
+  it again with a new key.
 
 ## Result envelope
 

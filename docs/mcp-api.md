@@ -958,9 +958,9 @@ output never cross roots. The file format and client setup are in the
   symlink, a replaced directory), calls to it return retryable `UNAVAILABLE`
   rather than executing somewhere else. A root check that hangs (a stuck
   hard-mounted export) gives up after a short bound and reports the same, so one
-  stuck mount never blocks the other roots. `workspace_status` and
-  `workspace_close` still work so a client can inspect and stop it; a closed root
-  reports `status: CLOSED` with `workspace_recover` as its next action.
+  stuck mount never blocks the other roots. `workspace_status` still works so a
+  client can inspect it; a root stopped by server shutdown reports
+  `status: CLOSED` with `workspace_recover` as its next action.
 - **Shared roots stay open.** Every client of the server shares a registered
   root, so `workspace_close` is a no-op that reports `shared: true`,
   `closed: false` and stops no task, shell, session, or operation; the root's
@@ -975,19 +975,35 @@ output never cross roots. The file format and client setup are in the
   are `running`, `completed`, `failed`, and `cancelled`; the result is the
   synchronous call's `data` (`output`, `exitCode`, `truncated`, and for `bash`
   `target`). An async command keeps its newest `maxOutputBytes` of output
-  instead of stopping at the limit. `tasks_run` with `tasks_status` remains the
-  path for jobs longer than 300 s.
-- **Restarts.** With the registry's `stateDir` (default
-  `~/.local/state/cloud-harness-local`), task and operation metadata (ID, key,
-  command, cwd, status, exit code, start and end times; never output) is
-  rewritten atomically on every change. After a restart, a task that was
-  running or queued reports `interrupted` and an operation reports `failed` with
-  `RUNNER_RESTARTED` instead of `NOT_FOUND`. Its idempotency key still returns
-  that handle, so a restart never re-runs a command on its own; retry with a new
-  key.
+  instead of stopping at the limit; `truncated` is then `true` both in the
+  result and on the `operation_status` envelope, even without a cursor.
+  `async: true` only frees the call: the command is still bounded by its
+  `timeoutMs` (default 60 s, at most 300 s). `tasks_run` with `tasks_status` is
+  the path for anything longer than 300 s. An `operation_wait` the client
+  aborts answers `CANCELLED`, not `TIMEOUT`, and the command keeps running.
+- **Restarts.** With the registry's `stateDir`, task and operation metadata
+  (ID, key, command, cwd, status, exit code, start and end times; never output)
+  is rewritten atomically on every change. HTTP mode defaults `stateDir` to
+  `~/.local/state/cloud-harness-local`; stdio mode persists only when the file
+  sets it, because every stdio client starts its own process. After a restart,
+  a task that was running or queued reports `interrupted` and an operation
+  reports `failed` with `RUNNER_RESTARTED` instead of `NOT_FOUND`. A `tasks_run`
+  that repeats the key of an interrupted task never re-runs it: it answers
+  `ok: false` with retryable `RUNNER_RESTARTED` and the old `taskId`; retry with
+  a new key.
+- **One process per state file.** Each workspace's state file belongs to one
+  server process, which holds `<file>.lock` (its pid) until shutdown. A second
+  process on the same `stateDir` and workspace (for example a stdio session
+  next to the systemd HTTP service on the same registry) logs one warning and
+  keeps its tasks in memory only, so it never marks the owner's live tasks
+  `interrupted` or overwrites its records. A lock whose pid is gone (a crash) is
+  taken over. Give each server process its own `stateDir`.
 - **Request limits.** `http.limits` sets the owner's `requestsPerMinute`
   (default 600), `inFlight` (32), and `maxBodyBytes` (4 MiB). Every local
-  client authenticates as the same owner and shares these.
+  client authenticates as the same owner and shares these. Requests without the
+  owner token go through a separate fixed pre-auth window (1000 per minute, 32
+  in flight) that `http.limits` never changes and that never uses the owner's
+  slots.
 - **Unchanged modes.** Single-root `--workspace` stdio keeps its
   close-stops-processes semantics and in-memory tasks, and the remote
   runner-backed HTTP service behaves as before.
@@ -995,8 +1011,13 @@ output never cross roots. The file format and client setup are in the
 ### Local tool surface
 
 Local servers (single-root and multi-root) leave out of `tools/list` every tool
-they cannot serve, and refuse a call that names one anyway with
-`INVALID_INPUT` naming the local alternative, never a generic worker error:
+they cannot serve. Because they are not registered, an MCP `tools/call` that
+names one gets the SDK's protocol error `Tool <name> not found`, not a tool
+result; a client holding a stale cached `tools/list` should reconnect to refresh
+it. The server instructions name the alternatives, and the backend's own
+`INVALID_INPUT` explanation (with the local alternative) is what a direct
+backend caller or a gated tool such as an allowed `git_push` gets. The hidden
+tools are:
 `agent_*` (start a CLI agent with `tasks_run`), `knowledge_*`, `artifacts_*`,
 `packages_*`, model tools, `secrets_list`, `workspace_open`,
 `workspace_finalize`, `git_identity_*`, `skill_suggest`, `git_pull` and
@@ -1006,7 +1027,9 @@ multi-root stdio, and `worktrees_*` when no registered root is inside a Git
 work tree. `github_read` and `github_action` keep their structured
 `REPOSITORY_OPERATION_NOT_AUTHORIZED` error and name the `gh` CLI. Each tool
 call writes one JSON line to stderr with `tool`, `workspaceId`, `durationMs`,
-and `outcome` (plus the error `code`), and never arguments or output. The list
+and `outcome` (plus the error `code`), and never arguments or output. It uses
+the same pino encoding as the server's other log lines (numeric `level`, 30 for
+`ok` and 40 for errors, epoch-millisecond `time`) and honours `LOG_LEVEL`. The list
 is owned by
 [`local-unsupported.ts`](../apps/api/src/local/local-unsupported.ts).
 

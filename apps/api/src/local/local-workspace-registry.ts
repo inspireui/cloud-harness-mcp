@@ -3,7 +3,6 @@ import { readFile, realpath, stat } from 'node:fs/promises';
 import { isAbsolute, relative, sep } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { z } from 'zod';
-import { defaultLocalStateDir } from './local-task-state.js';
 
 /**
  * Operator-owned registry of persistent local workspace roots. The file is the only way to
@@ -39,7 +38,10 @@ const HttpSchema = z.object({
 
 const WorkspaceConfigSchema = z.object({
   version: z.literal(1),
-  /** Where task metadata survives restarts; defaults to ~/.local/state/cloud-harness-local. */
+  /**
+   * Where task metadata survives restarts. HTTP mode defaults to ~/.local/state/cloud-harness-local;
+   * stdio mode persists only when this is set, because every stdio client starts its own process.
+   */
   stateDir: z.string().min(1).refine(isAbsolute, 'stateDir must be absolute').optional(),
   http: HttpSchema.optional(),
   workspaces: z.record(AliasSchema, WorkspaceEntrySchema).refine((value) => Object.keys(value).length > 0, 'at least one workspace is required')
@@ -64,7 +66,8 @@ export type RegisteredLocalWorkspace = {
 export type LocalWorkspaceRegistry = {
   workspaces: RegisteredLocalWorkspace[];
   http: LocalHttpSettings;
-  stateDir: string;
+  /** The configured `stateDir`, if any; each transport picks its own default. */
+  stateDir?: string;
 };
 
 /**
@@ -125,5 +128,5 @@ export async function loadLocalWorkspaceRegistry(configPath: string): Promise<Lo
       ...(entry.gitPush !== undefined ? { gitPush: entry.gitPush } : {})
     });
   }
-  return { workspaces, http: config.http ?? HttpSchema.parse({}), stateDir: config.stateDir ?? defaultLocalStateDir() };
+  return { workspaces, http: config.http ?? HttpSchema.parse({}), ...(config.stateDir ? { stateDir: config.stateDir } : {}) };
 }

@@ -1,5 +1,5 @@
-import { execFileSync } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { copyFile, mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -17,6 +17,12 @@ const options: CliOptions = { transport: 'stdio', gitNetwork: false, gitPush: fa
 
 type OperationData = { operationId: string; status: string; result?: { output: string; exitCode?: number; truncated: boolean; target?: string } };
 type TaskView = { id: string; status: string; exitCode?: number; startedAt?: string; endedAt?: string };
+
+/** A pid that belonged to a process which has exited. */
+function deadPid(): number {
+  const child = spawnSync(process.execPath, ['-e', '']);
+  return child.pid!;
+}
 
 async function listTools(backend: OperationBackend): Promise<string[]> {
   const server = createCloudHarnessServer(backend);
@@ -109,6 +115,35 @@ describe('local batch mode', () => {
       expect(after.ok).toBe(false);
       expect(after.data).toMatchObject({ status: 'cancelled' });
       expect(after.error?.code).toBe('CANCELLED');
+    });
+
+    it('reports a wait the client aborted as CANCELLED, not TIMEOUT, and leaves the command running', async () => {
+      const started = await router.call('exec_run', { workspaceId: id('alpha'), command: 'sleep 30', async: true, timeoutMs: 60_000 });
+      const operationId = (started.data as OperationData).operationId;
+      const controller = new AbortController();
+      setTimeout(() => controller.abort(), 200);
+      const waited = await router.call('operation_wait', { operationId, timeoutMs: 10_000 }, controller.signal);
+      expect(waited.ok).toBe(false);
+      expect(waited.error).toMatchObject({ code: 'CANCELLED', message: expect.stringContaining('aborted by the client') });
+      expect((await router.call('operation_status', { operationId })).data).toMatchObject({ status: 'running' });
+      await router.call('operation_cancel', { operationId });
+    });
+
+    it('keeps the newest maxOutputBytes of a long output and reports it truncated', async () => {
+      const started = await router.call('exec_run', { workspaceId: id('alpha'), command: 'seq 1 5000', async: true, maxOutputBytes: 1024 });
+      const operationId = (started.data as OperationData).operationId;
+      const waited = await router.call('operation_wait', { operationId, timeoutMs: 10_000 });
+      const result = (waited.data as OperationData).result!;
+      expect(result.truncated).toBe(true);
+      expect(Buffer.byteLength(result.output)).toBeLessThanOrEqual(1024);
+      expect(result.output.endsWith('5000\n')).toBe(true);
+
+      // Without a cursor the envelope still says early output was dropped, and offers no cursor
+      // because the whole kept tail fits in one page.
+      const status = await router.call('operation_status', { operationId });
+      expect(status.truncated).toBe(true);
+      expect(status.cursor).toBeUndefined();
+      expect((status.data as { result: { truncated: boolean } }).result.truncated).toBe(true);
     });
 
     it('marks an operation that outlives its timeoutMs as a TIMEOUT failure', async () => {
@@ -206,8 +241,20 @@ describe('local batch mode', () => {
       const instructions = router.getInstructions();
       expect(instructions).not.toMatch(/close it when finished/i);
       expect(instructions).toContain('Do not call workspace_close');
-      expect(instructions).toContain('tasks_run');
+      expect(instructions).toContain('For anything longer than 300 s use tasks_run');
       expect(instructions).toContain('operation_wait');
+    });
+
+    it('keeps the "do not close" sentence out of single-root instructions, where workspace_close really closes', async () => {
+      const single = new LocalWorkspaceBackend(join(base, 'alpha'), options);
+      try {
+        const instructions = single.getInstructions();
+        expect(instructions).not.toContain('Do not call workspace_close');
+        expect(instructions).toContain('For anything longer than 300 s use tasks_run');
+        expect(await listTools(single)).toContain('workspace_close');
+      } finally {
+        await single.close();
+      }
     });
   });
 
@@ -234,7 +281,11 @@ describe('local batch mode', () => {
       expect(typeof entries[0]!.durationMs).toBe('number');
       expect(entries[1]).toMatchObject({ tool: 'exec_run', outcome: 'error', code: 'CONFLICT' });
       expect(lines.join('')).not.toContain('secret-sentinel-value');
-      expect(Object.keys(entries[0]!).sort()).toEqual(['durationMs', 'level', 'msg', 'outcome', 'time', 'tool', 'workspaceId']);
+      expect(Object.keys(entries[0]!).sort()).toEqual(['durationMs', 'hostname', 'level', 'msg', 'outcome', 'pid', 'time', 'tool', 'workspaceId']);
+      // pino's encoding, like apiLogger: numeric level, epoch-millisecond time.
+      expect(entries[0]).toMatchObject({ level: 30 });
+      expect(entries[1]).toMatchObject({ level: 40 });
+      expect(typeof entries[0]!.time).toBe('number');
     });
   });
 
@@ -264,9 +315,15 @@ describe('local batch mode', () => {
       expect(finished.data).toMatchObject({ status: 'succeeded', exitCode: 0 });
       expect((finished.data as TaskView).startedAt).toBeDefined();
 
-      // The same key returns the interrupted handle instead of silently running the command again.
+      // The same key returns the interrupted handle instead of silently running the command again,
+      // and says so rather than answering "Task queued".
       const retried = await router.call('tasks_run', { workspaceId: id('alpha'), command: 'sleep 30', idempotencyKey: 'restart-long-1' });
-      expect((retried.data as { taskId: string }).taskId).toBe(longId);
+      expect(retried.ok).toBe(false);
+      expect(retried.error).toMatchObject({ code: 'RUNNER_RESTARTED', retryable: true, message: expect.stringContaining('retry with a new idempotencyKey') });
+      expect(retried.data).toMatchObject({ taskId: longId, status: 'interrupted' });
+      // A finished task's key still answers ok with its handle.
+      const replayed = await router.call('tasks_run', { workspaceId: id('alpha'), command: 'echo finished', idempotencyKey: 'restart-done-1' });
+      expect(replayed).toMatchObject({ ok: true, data: { taskId: doneId, status: 'succeeded' } });
 
       const operation = await router.call('operation_status', { operationId });
       expect(operation.data).toMatchObject({ status: 'failed' });
@@ -287,8 +344,14 @@ describe('local batch mode', () => {
       expect(saved.records[0]).not.toHaveProperty('output');
       expect((await stat(file)).mode & 0o777).toBe(0o600);
 
-      // A crash never runs shutdown: a fresh pool reads the record exactly as it was left.
-      const crashed = new LocalWorkspacePool(workspaces, options, undefined, stateDir);
+      // A crash never runs shutdown or removes its lock: a fresh process reads the record exactly
+      // as it was left. Model it with a copy of the file and a lock whose pid no longer exists.
+      const crashDir = join(base, 'crash-state');
+      await mkdir(join(crashDir, 'tasks'), { recursive: true });
+      const copied = join(crashDir, 'tasks', `${id('beta')}.json`);
+      await copyFile(file, copied);
+      await writeFile(`${copied}.lock`, String(deadPid()));
+      const crashed = new LocalWorkspacePool(workspaces, options, undefined, crashDir);
       try {
         const status = await new MultiLocalWorkspaceBackend(crashed, 'explicit').call('tasks_status', { workspaceId: id('beta'), taskId });
         expect(status.data).toMatchObject({ status: 'interrupted' });
@@ -296,6 +359,41 @@ describe('local batch mode', () => {
         // Its records are already interrupted, so this stops nothing.
         await crashed.close();
       }
+    });
+
+    it('lets only one live server own a state file; a second one runs without persistence', async () => {
+      const first = await router.call('tasks_run', { workspaceId: id('alpha'), command: 'sleep 30', idempotencyKey: 'owner-1', timeoutMs: 60_000 });
+      const firstId = (first.data as { taskId: string }).taskId;
+      const file = join(stateDir, 'tasks', `${id('alpha')}.json`);
+      expect((await readFile(`${file}.lock`, 'utf8')).trim()).toBe(String(process.pid));
+
+      const warnings: string[] = [];
+      vi.spyOn(process.stderr, 'write').mockImplementation((chunk: string | Uint8Array) => {
+        warnings.push(String(chunk));
+        return true;
+      });
+      const second = new LocalWorkspacePool(workspaces, options, undefined, stateDir);
+      try {
+        const other = new MultiLocalWorkspaceBackend(second, 'explicit');
+        // It never reads (and so never marks interrupted) the first server's live task.
+        expect((await other.call('tasks_status', { workspaceId: id('alpha'), taskId: firstId })).error?.code).toBe('NOT_FOUND');
+        expect((await other.call('tasks_run', { workspaceId: id('alpha'), command: 'true', idempotencyKey: 'intruder-1' })).ok).toBe(true);
+      } finally {
+        await second.close();
+      }
+      expect(warnings.join('')).toContain('owns this task state');
+
+      // The file still holds only the owner's record, still running, and the owner keeps its lock.
+      const saved = JSON.parse(await readFile(file, 'utf8')) as { records: Array<{ id: string; status: string }> };
+      expect(saved.records).toEqual([expect.objectContaining({ id: firstId, status: 'running' })]);
+      expect((await readFile(`${file}.lock`, 'utf8')).trim()).toBe(String(process.pid));
+
+      // Shutdown releases the lock, so the next server takes the file over.
+      await pool.close();
+      await expect(stat(`${file}.lock`)).rejects.toThrow();
+      pool = new LocalWorkspacePool(workspaces, options, undefined, stateDir);
+      router = new MultiLocalWorkspaceBackend(pool, 'explicit');
+      expect((await router.call('tasks_status', { workspaceId: id('alpha'), taskId: firstId })).data).toMatchObject({ status: 'interrupted' });
     });
 
     it('starts empty when the state file is corrupt', async () => {

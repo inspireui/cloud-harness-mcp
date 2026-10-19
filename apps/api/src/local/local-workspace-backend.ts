@@ -23,10 +23,14 @@ const opaqueId = (prefix: string) => `${prefix}_${randomBytes(24).toString('base
 const OPERATION_WAIT_MAX_MS = 300_000;
 
 /** Shared by the single-root and multi-root local servers. */
-export const LOCAL_LONG_JOB_GUIDANCE = 'Do not call workspace_close when finished: local workspaces are pre-registered and stay open. '
-  + 'exec_run and bash block for at most their timeoutMs (300000 max); run anything longer with tasks_run (unique idempotencyKey, explicit timeoutMs) and poll tasks_status with its cursor, '
-  + 'or pass async: true to exec_run/bash and call operation_wait. '
-  + 'Remote-only tools (agents, knowledge, artifacts, packages, model profiles, GitHub broker) are not offered here; use the gh CLI through exec_run for GitHub.';
+export const LOCAL_LONG_JOB_GUIDANCE = 'exec_run and bash block for at most their timeoutMs (default 60000, max 300000). '
+  + 'For anything longer than 300 s use tasks_run (unique idempotencyKey, explicit timeoutMs) and poll tasks_status with its cursor; '
+  + 'async: true on exec_run/bash only frees the call while a command of up to 300 s runs, then operation_wait collects it. '
+  + 'Remote-only tools (agents, knowledge, artifacts, packages, model profiles, GitHub broker) are not offered here and calls to them answer "tool not found"; '
+  + 'use the gh CLI through exec_run for GitHub and tasks_run with a CLI agent for sub-agents.';
+
+/** Only for the pre-registered roots of a workspace config, which clients cannot close. */
+export const LOCAL_REGISTERED_GUIDANCE = 'Do not call workspace_close when finished: local workspaces are pre-registered and stay open. ';
 
 export class LocalWorkspaceBackend implements OperationBackend {
   public readonly workspaceId: string;
@@ -778,6 +782,18 @@ export class LocalWorkspaceBackend implements OperationBackend {
           typeof input.maxOutputBytes === 'number' ? input.maxOutputBytes : 1_048_576,
           Array.isArray(input.dependsOn) ? (input.dependsOn as string[]) : []
         );
+        if (record.status === 'interrupted') {
+          // A new task never starts interrupted: the key named a task from before a restart, which
+          // is never re-run behind the caller's back, so say so instead of answering "queued".
+          const msg = `task ${record.id} with this idempotencyKey was interrupted by a server restart; retry with a new idempotencyKey`;
+          return {
+            ok: false,
+            message: msg,
+            data: { taskId: record.id, status: record.status },
+            error: { code: 'RUNNER_RESTARTED', message: msg, retryable: true },
+            truncated: false
+          };
+        }
         return {
           ok: true,
           message: 'Task queued',
@@ -924,6 +940,15 @@ export class LocalWorkspaceBackend implements OperationBackend {
       const startTime = Date.now();
       record = await this.operationManager.waitOperation(this.workspaceId, operationId, timeoutMs, signal);
       const status = operationStatus(record.status);
+      if (status === 'running' && signal?.aborted) {
+        // The client went away before the deadline; that is not a timeout.
+        return {
+          ok: false,
+          message: 'operation_wait aborted by the client',
+          error: { code: 'CANCELLED', message: 'operation_wait aborted by the client; the operation keeps running', retryable: true },
+          truncated: false
+        };
+      }
       if (status === 'running') {
         return {
           ok: false,
@@ -962,7 +987,10 @@ export class LocalWorkspaceBackend implements OperationBackend {
     }
     const status = operationStatus(record.status);
     const error = operationError(record);
-    const more = page.truncated && Number(page.cursor) < record.offset + record.output.length;
+    // Truncated also when the oldest output was dropped (an async command keeps only its newest
+    // maxOutputBytes), so a call without a cursor still learns it saw only the tail.
+    const more = Number(page.cursor) < record.offset + record.output.length;
+    const truncated = page.truncated || record.offset > 0;
     return {
       ok: status !== 'failed' && status !== 'cancelled',
       message: `Operation ${status}`,
@@ -978,7 +1006,7 @@ export class LocalWorkspaceBackend implements OperationBackend {
       },
       ...(error ? { error } : {}),
       ...(more ? { cursor: page.cursor } : {}),
-      truncated: more
+      truncated
     };
   }
 

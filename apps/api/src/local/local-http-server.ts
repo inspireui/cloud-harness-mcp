@@ -24,13 +24,22 @@ export function readLocalBearerToken(env: NodeJS.ProcessEnv = process.env): stri
 
 const digest = (value: string) => createHash('sha256').update(value).digest();
 
-function localBearerAuth(expected: string) {
+/** The request's bearer token when it is the owner token, compared in constant time. */
+function ownerToken(expected: string): (request: Request) => string | undefined {
   const expectedDigest = digest(expected);
-  return (request: AuthenticatedRequest, response: Response, next: NextFunction): void => {
+  return (request) => {
     const authorization = request.header('authorization') ?? '';
     const token = authorization.startsWith('Bearer ') ? authorization.slice(7) : '';
     // Comparing fixed-length digests keeps the check constant-time regardless of token length.
-    if (!token || !timingSafeEqual(digest(token), expectedDigest)) {
+    return token && timingSafeEqual(digest(token), expectedDigest) ? token : undefined;
+  };
+}
+
+function localBearerAuth(expected: string) {
+  const owner = ownerToken(expected);
+  return (request: AuthenticatedRequest, response: Response, next: NextFunction): void => {
+    const token = owner(request);
+    if (!token) {
       response.setHeader('WWW-Authenticate', 'Bearer');
       response.status(401).json({ error: 'authentication_required' });
       return;
@@ -59,11 +68,18 @@ export function createLocalHttpApp(pool: LocalWorkspacePool, settings: LocalHttp
   const app = express();
   app.disable('x-powered-by');
   app.get('/healthz', (_request, response) => response.json({ status: 'ok' }));
-  // The configured limits (`http.limits`) apply to the single local owner. The pre-auth limiter
-  // never admits less than the remote API's own floor, so raising the owner limits is not undone by it.
+  // The configured limits (`http.limits`) apply to the single local owner. Requests without the
+  // owner token go through the remote API's fixed pre-auth window (1000/min, 32 in flight) before
+  // they are refused, so raising the owner limits never raises what unauthenticated traffic gets,
+  // and unauthenticated traffic never takes the owner's in-flight slots.
   const { requestsPerMinute, inFlight, maxBodyBytes } = settings.limits;
-  const preAuth = { requestsPerMinute: Math.max(1_000, requestsPerMinute), inFlight: Math.max(32, inFlight) };
-  app.use('/mcp', requestSecurity(security), preAuthRequestLimits(preAuth), localBearerAuth(bearerToken), principalRequestLimits(1_000, { requestsPerMinute, inFlight }));
+  const isOwner = ownerToken(bearerToken);
+  const preAuth = preAuthRequestLimits();
+  const unauthenticatedLimits = (request: Request, response: Response, next: NextFunction): void => {
+    if (isOwner(request)) next();
+    else preAuth(request, response, next);
+  };
+  app.use('/mcp', requestSecurity(security), unauthenticatedLimits, localBearerAuth(bearerToken), principalRequestLimits(1_000, { requestsPerMinute, inFlight }));
   app.use('/mcp', express.json({ limit: maxBodyBytes, strict: true }));
   app.all('/mcp', async (request: Request, response: Response) => {
     if (request.method === 'POST' && !request.is('application/json')) {

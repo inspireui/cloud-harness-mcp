@@ -80,6 +80,23 @@ describe('local HTTP limits', () => {
     expect(response.status).toBe(200);
   });
 
+  it('keeps unauthenticated traffic in its own fixed pre-auth window, whatever the owner limits', async () => {
+    const { url } = await start('    requestsPerMinute: 100000\n    inFlight: 1024\n');
+    const anonymous = { ...headers, authorization: 'Bearer wrong-token' };
+    let last = 0;
+    for (let attempt = 0; attempt < 1_001; attempt += 1) {
+      const response = await fetch(`${url}/mcp`, { method: 'POST', headers: anonymous, body: toolsList });
+      await response.arrayBuffer();
+      last = response.status;
+    }
+    // The 1001st unauthenticated request in a minute is refused, as with the default owner limits.
+    expect(last).toBe(429);
+    // The owner is not counted in that window and still gets through.
+    const owner = await fetch(`${url}/mcp`, { method: 'POST', headers, body: toolsList });
+    await owner.arrayBuffer();
+    expect(owner.status).toBe(200);
+  });
+
   it('keeps the remote per-principal default of 8 requests in flight', async () => {
     const app = express();
     const release: Array<() => void> = [];

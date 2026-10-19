@@ -1,5 +1,5 @@
 import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises';
-import { homedir, tmpdir } from 'node:os';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { WorkspaceIdSchema } from '@cloud-harness/contracts';
@@ -45,7 +45,8 @@ describe('local workspace registry', () => {
       allowedOrigins: [],
       limits: { requestsPerMinute: 600, inFlight: 32, maxBodyBytes: 4_194_304 }
     });
-    expect(first.stateDir).toBe(join(homedir(), '.local', 'state', 'cloud-harness-local'));
+    // Each transport picks its own default; stdio persists only with an explicit stateDir.
+    expect(first.stateDir).toBeUndefined();
   });
 
   it('reads HTTP limits and the state directory, filling unset limits with the local defaults', async () => {

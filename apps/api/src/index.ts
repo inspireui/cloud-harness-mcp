@@ -7,6 +7,7 @@ import { loadApiConfig } from './config.js';
 import { parseCliOptions, getCliHelp } from './cli-options.js';
 import { createLocalHttpApp, isLoopbackHost, readLocalBearerToken } from './local/local-http-server.js';
 import { LocalWorkspaceBackend } from './local/local-workspace-backend.js';
+import { defaultLocalStateDir } from './local/local-task-state.js';
 import { loadLocalWorkspaceRegistry, type LocalWorkspaceRegistry } from './local/local-workspace-registry.js';
 import { LocalWorkspacePool, MultiLocalWorkspaceBackend } from './local/multi-local-workspace-backend.js';
 import type { OperationBackend } from './operation-backend.js';
@@ -56,6 +57,8 @@ if (options.transport === 'stdio') {
   let backend: OperationBackend & { close(): Promise<void> };
   if (options.workspaceConfig) {
     const registry = await loadRegistryOrExit(options.workspaceConfig);
+    // Every stdio client starts its own process, so task state persists only with an explicit
+    // stateDir, which must then belong to this one process (the file lock enforces it).
     const pool = new LocalWorkspacePool(registry.workspaces, options, undefined, registry.stateDir);
     // One stdio process serves one client, so its active-workspace preference is client-scoped.
     const router = new MultiLocalWorkspaceBackend(pool, 'client');
@@ -114,7 +117,8 @@ if (options.transport === 'stdio') {
     process.exit(1);
   }
   const registry = await loadRegistryOrExit(options.workspaceConfig);
-  const pool = new LocalWorkspacePool(registry.workspaces, options, undefined, registry.stateDir);
+  const stateDir = registry.stateDir ?? defaultLocalStateDir();
+  const pool = new LocalWorkspacePool(registry.workspaces, options, undefined, stateDir);
   const { host, port } = registry.http;
   const local = createLocalHttpApp(pool, registry.http, bearerToken);
   const server = createServer(local.app);
@@ -122,7 +126,7 @@ if (options.transport === 'stdio') {
     apiLogger.warn({ host }, 'Local multi-workspace MCP is bound to a non-loopback address: anyone who can reach it with the bearer token gets host-user execution, and plain HTTP sends the token in cleartext; put it behind TLS');
   }
   server.listen(port, host, () =>
-    apiLogger.info({ host, port, workspaces: registry.workspaces.length, limits: registry.http.limits, stateDir: registry.stateDir }, 'Local multi-workspace MCP listening')
+    apiLogger.info({ host, port, workspaces: registry.workspaces.length, limits: registry.http.limits, stateDir }, 'Local multi-workspace MCP listening')
   );
 
   let shuttingDown = false;

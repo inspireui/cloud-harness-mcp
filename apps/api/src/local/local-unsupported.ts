@@ -4,8 +4,10 @@ import { isModelToolOperation, type RunnerOperation, type RunnerResponse } from 
 /**
  * Tools that no local backend can serve: they need the remote runner's agents, stores, or GitHub
  * broker, or the local worker has no handler for them. Local servers leave them out of tools/list,
- * and a call that names one anyway gets this explanation with the local alternative instead of a
- * generic worker error. Remote mode never consults this table.
+ * so an MCP tools/call that names one gets the SDK's "Tool ... not found" protocol error; the
+ * server instructions name the alternatives instead. A direct backend call (or a gated tool such as
+ * an allowed git_push) gets this explanation with the local alternative instead of a generic worker
+ * error. Remote mode never consults this table.
  */
 const UNSUPPORTED_PREFIXES: Array<[prefix: string, reason: string]> = [
   ['agent_', 'managed agents run only in the remote runner; start a CLI agent (for example `claude -p` or `codex exec`) with tasks_run and poll tasks_status'],

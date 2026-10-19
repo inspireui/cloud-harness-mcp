@@ -2,7 +2,7 @@ import { realpath, stat } from 'node:fs/promises';
 import type { RunnerOperation, RunnerResponse } from '@cloud-harness/contracts';
 import type { OperationBackend } from '../operation-backend.js';
 import type { CliOptions } from '../cli-options.js';
-import { LOCAL_LONG_JOB_GUIDANCE, LocalWorkspaceBackend } from './local-workspace-backend.js';
+import { LOCAL_LONG_JOB_GUIDANCE, LOCAL_REGISTERED_GUIDANCE, LocalWorkspaceBackend } from './local-workspace-backend.js';
 import type { RegisteredLocalWorkspace } from './local-workspace-registry.js';
 import { LocalTaskStateFile } from './local-task-state.js';
 import { logLocalToolCall } from './local-call-log.js';
@@ -171,7 +171,7 @@ export class MultiLocalWorkspaceBackend implements OperationBackend {
     return `This is a Cloud Harness local multi-workspace server. Registered persistent workspaces are already open: ${names}. `
       + `Call workspace_list to see their status. ${selection} `
       + 'Operations execute in the selected project folder with host-user permissions. Path confinement prevents tool path escapes; commands run with host authority. '
-      + LOCAL_LONG_JOB_GUIDANCE;
+      + LOCAL_REGISTERED_GUIDANCE + LOCAL_LONG_JOB_GUIDANCE;
   }
 
   supportsOperation(operation: RunnerOperation): boolean {

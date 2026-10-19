@@ -911,12 +911,19 @@ never for mutually untrusted users.
   requests. Binding it to a non-loopback address exposes host-user execution to
   anyone holding the token. Its per-owner limits and body size come from
   `http.limits` in the registry, with higher defaults than the remote API
-  because every local client is the one owner.
+  because every local client is the one owner. `http.limits` applies only to
+  requests that carry the owner token: every other request goes through a
+  separate fixed pre-auth window (1000 per minute, 32 in flight) before it is
+  refused, so raising the owner limits never widens what unauthenticated
+  traffic gets, and unauthenticated traffic never takes the owner's slots.
 - Clients share every registered root, so `workspace_close` cannot stop another
   client's processes: it is a no-op on a registered root.
 - Task and async-operation metadata, including the command text, is saved under
   the registry's `stateDir` with owner-only permissions (directory `0700`, file
-  `0600`) so a restart can report interrupted work. Output is never saved. A
+  `0600`) so a restart can report interrupted work. One server process owns
+  each workspace's file through an exclusive `<file>.lock` holding its pid;
+  another process on the same `stateDir` runs without persistence instead of
+  overwriting it. Output is never saved. A
   command that carries a secret on its command line therefore lands in that
   file; pass secrets through forwarded environment variables instead.
 - The per-call log line on stderr carries the tool, workspace, duration, and

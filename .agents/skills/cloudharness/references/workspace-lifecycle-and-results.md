@@ -32,17 +32,20 @@ operator-registered folder; no tool can add one.
 - Local servers list only the tools they can serve. Agents, knowledge,
   artifacts, packages, model profiles, secrets, `github_*`, `git_pull`,
   `git_push`, `git_identity_*`, `skill_suggest`, `workspace_finalize`, and
-  (when no folder is a Git work tree) `worktrees_*` are left out; a call that
-  names one anyway returns `INVALID_INPUT` with the local alternative, such as
-  the `gh` CLI or `git push` through `exec_run`, or a CLI agent run with
-  `tasks_run`.
-- Long jobs: `exec_run`/`bash` block for at most `timeoutMs`. Pass
-  `async: true` for an `op_` handle and call `operation_wait` (at most 300 s per
-  call) or `operation_status`, or use `tasks_run` with a unique
-  `idempotencyKey` and poll `tasks_status`. Task and operation handles survive a
-  server restart as metadata only: a handle that was running reports
-  `interrupted` (operations: `failed` with `RUNNER_RESTARTED`) and its output is
-  gone, so start it again with a new key.
+  (when no folder is a Git work tree) `worktrees_*` are left out; calling one
+  anyway fails with `Tool <name> not found` (reconnect if your tool list is
+  stale). Use the alternatives instead: the `gh` CLI or `git push` through
+  `exec_run`, or a CLI agent run with `tasks_run`.
+- Long jobs: `exec_run`/`bash` block for at most `timeoutMs` (default 60 s, at
+  most 300 s). For anything longer than 300 s use `tasks_run` with a unique
+  `idempotencyKey` and an explicit `timeoutMs`, and poll `tasks_status`.
+  `async: true` only frees the call while a command of up to 300 s runs: you get
+  an `op_` handle for `operation_wait` (at most 300 s per call) or
+  `operation_status`. Task and operation handles survive a server restart as
+  metadata only: a handle that was running reports `interrupted` (operations:
+  `failed` with `RUNNER_RESTARTED`) and its output is gone. Repeating its key in
+  `tasks_run` returns `RUNNER_RESTARTED` instead of re-running it, so start it
+  again with a new key.
 
 ## Result envelope
 

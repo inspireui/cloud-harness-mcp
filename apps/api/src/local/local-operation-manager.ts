@@ -684,6 +684,7 @@ export class LocalOperationManager {
       }
     }
     this.persist();
+    this.stateFile?.release();
     await Promise.all(toTerminate.map((c) => terminateProcess(c)));
   }
 
@@ -712,6 +713,8 @@ export class LocalOperationManager {
       if (key.includes(`:${workspaceId}:`)) this.idempotency.delete(key);
     }
     this.persist();
+    // A reopened backend takes the file over with a fresh manager.
+    this.stateFile?.release();
   }
 
   view(record: Managed): {

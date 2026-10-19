@@ -78,7 +78,7 @@ workspaces:
     path: /mnt/volumes/web
     gitNetwork: true   # optional per-workspace override of --git-network
     gitPush: false     # optional per-workspace override of --git-push
-stateDir: /var/lib/cloud-harness-local   # optional; default ~/.local/state/cloud-harness-local
+stateDir: /var/lib/cloud-harness-local   # optional; HTTP default ~/.local/state/cloud-harness-local, stdio: off
 http:                  # optional; used only with --transport http
   host: 127.0.0.1
   port: 3100
@@ -135,15 +135,22 @@ it fail with a retryable `UNAVAILABLE` error and `workspace_list` reports
 `rootAvailable: false` until the mount returns.
 
 Registered folders are shared by every client, so `workspace_close` is a no-op
-there: it never stops another client's tasks, shells, or sessions. For work
-longer than one call (300 seconds at most), use `tasks_run` and poll
-`tasks_status`, or pass `async: true` to `exec_run` or `bash` and call
-`operation_wait`. Task records survive a restart in `stateDir`; work that was
-running then reports `interrupted`. The server lists only the tools local mode
-can serve: use the `gh` CLI through `exec_run` instead of `github_*`, and a CLI
-agent started with `tasks_run` instead of `agent_*`. Each call writes one JSON
-line (tool, workspace, duration, outcome) to stderr, which `journalctl` shows
-for a systemd service.
+there: it never stops another client's tasks, shells, or sessions. A command
+run with `exec_run` or `bash` is bounded by its `timeoutMs` (default 60
+seconds, at most 300); for anything longer use `tasks_run` and poll
+`tasks_status`. `async: true` on `exec_run` or `bash` only frees the call while
+a command of up to 300 seconds runs, then `operation_wait` collects it. Task
+records survive a restart in `stateDir`; work that was running then reports
+`interrupted`. Each `stateDir` belongs to one server process: a second process
+on the same registry and `stateDir` (say, a stdio session next to the HTTP
+service) warns once and keeps its tasks in memory only, so give it its own
+`stateDir` if it needs persistence. Stdio mode persists only when `stateDir` is
+set. The server lists only the tools local mode can serve; a call to a hidden
+one fails with `Tool <name> not found`. Use the `gh` CLI through `exec_run`
+instead of `github_*`, and a CLI agent started with `tasks_run` instead of
+`agent_*`. Each call writes one JSON line (tool, workspace, duration, outcome)
+to stderr, in the same format as the server's other log lines, which
+`journalctl` shows for a systemd service.
 
 ::: warning Host authority
 Every registered folder runs commands as the host user that started the server.

@@ -126,6 +126,7 @@ In local mode:
 - File operations, patches, grep search, symbol search, sessions, tasks, and local Git tools operate directly on the folder.
 - `workspace_close` terminates owned child processes and tasks but **never deletes your local project folder**. With `--workspace-config`, folders are shared by every client and `workspace_close` is a no-op.
 - `exec_run` and `bash` accept `async: true` and return an operation handle for `operation_wait`; `tasks_run` runs longer jobs.
+- `files_import` downloads files the client passes by reference (OpenAI Apps SDK `openai/fileParams`), such as an image ChatGPT generated, into the workspace over HTTPS, so images never travel as base64.
 - Only tools local mode can serve are listed; remote-only tools (agents, knowledge, artifacts, packages, model profiles, `github_*`) are left out, and a call to one names the local alternative.
 - Tool paths and working directories are strictly confined within the workspace root.
 - Commands (`exec_run`, shells, tasks) execute with host-user permissions. File path confinement is not an OS sandbox.

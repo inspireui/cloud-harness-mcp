@@ -1004,6 +1004,30 @@ output never cross roots. The file format and client setup are in the
   owner token go through a separate fixed pre-auth window (1000 per minute, 32
   in flight) that `http.limits` never changes and that never uses the owner's
   slots.
+- **Files by reference.** `files_import` (local only; the remote server does
+  not list it) downloads files the client passes by reference into a
+  workspace directory, so an image ChatGPT generated or a user uploaded never
+  travels as base64 in a tool call. Its descriptor sets
+  `_meta["openai/fileParams"] = ["files"]` (OpenAI Apps SDK file params), and
+  each `files` entry is `{ download_url, file_id, mime_type?, file_name? }`.
+  Input: `workspaceId`, `dir` (relative to the root or absolute inside it,
+  created when missing, confined like every tool path), `files` (1-16),
+  optional `names` (same order; default the sanitized `file_name`, else
+  `file_id` plus an extension from the MIME type), and `overwrite` (default
+  `false`). Each URL must be `https` (every redirect hop too, at most 5), each
+  download has 60 s and at most `fileImport.maxFileBytes` (default 50 MiB,
+  enforced while streaming), and each file is written to a temporary file and
+  renamed into place. Without `overwrite` an existing name fails with `EXISTS`
+  and is never replaced. Each `data.files[]` entry is either
+  `{ ok: true, path, bytes, sha256, mime, file_id }` (MIME from the PNG, JPEG,
+  WebP, or GIF signature, else the response header, else the client's
+  `mime_type`) or `{ ok: false, error: { code, message, retryable } }` with
+  `INVALID_URL`, `INSECURE_URL`, `HTTP_ERROR`, `TOO_MANY_REDIRECTS`,
+  `NETWORK_ERROR`, `TIMEOUT`, `CANCELLED`, `TOO_LARGE`, `INVALID_NAME`,
+  `DUPLICATE_NAME`, `EXISTS`, or `WRITE_FAILED`. The call is `ok: true` when at
+  least one file was imported (the message names the failures) and `ok: false`
+  only when none was. The download URL is a capability: it is never logged
+  and never appears in a result.
 - **Unchanged modes.** Single-root `--workspace` stdio keeps its
   close-stops-processes semantics and in-memory tasks, and the remote
   runner-backed HTTP service behaves as before.

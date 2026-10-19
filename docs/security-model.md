@@ -928,6 +928,16 @@ never for mutually untrusted users.
   file; pass secrets through forwarded environment variables instead.
 - The per-call log line on stderr carries the tool, workspace, duration, and
   outcome only, never arguments or output.
+- `files_import` (local only) makes the server fetch client-supplied URLs.
+  Only `https` is accepted, on every redirect hop (at most 5); plain `http` is
+  refused unless `CLOUD_HARNESS_FILE_IMPORT_ALLOW_LOOPBACK_HTTP=1` is set, and
+  then only for `127.0.0.1`, `::1`, or `localhost` (tests). Downloads are
+  capped by `fileImport.maxFileBytes` while streaming and by a 60 s deadline,
+  land in a destination confined like every tool path, and are renamed into
+  place, replacing a symlink at the final name rather than following it. The
+  download URL is a bearer capability: it is never logged, stored, or echoed in
+  a result or error. The owner token already grants host execution, so the
+  fetch adds no authority beyond it; it does not block private HTTPS addresses.
 
 ## Repository capability introspection and authorization preflight
 

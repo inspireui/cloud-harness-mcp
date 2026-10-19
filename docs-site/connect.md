@@ -86,6 +86,8 @@ http:                  # optional; used only with --transport http
     requestsPerMinute: 600
     inFlight: 32
     maxBodyBytes: 4194304
+fileImport:            # optional; files_import download cap per file
+  maxFileBytes: 52428800
 ```
 
 The file is the only way to register a folder: no tool can add, move, or rename

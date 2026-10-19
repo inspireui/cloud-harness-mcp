@@ -8,6 +8,7 @@ import { parseCliOptions, getCliHelp } from './cli-options.js';
 import { createLocalHttpApp, isLoopbackHost, readLocalBearerToken } from './local/local-http-server.js';
 import { LocalWorkspaceBackend } from './local/local-workspace-backend.js';
 import { defaultLocalStateDir } from './local/local-task-state.js';
+import { defaultFileImportSettings, type FileImportSettings } from './local/local-file-import.js';
 import { loadLocalWorkspaceRegistry, type LocalWorkspaceRegistry } from './local/local-workspace-registry.js';
 import { LocalWorkspacePool, MultiLocalWorkspaceBackend } from './local/multi-local-workspace-backend.js';
 import type { OperationBackend } from './operation-backend.js';
@@ -43,6 +44,10 @@ async function loadRegistryOrExit(configPath: string): Promise<LocalWorkspaceReg
   }
 }
 
+function fileImportSettings(registry: LocalWorkspaceRegistry): FileImportSettings {
+  return { ...defaultFileImportSettings(), maxFileBytes: registry.fileImport.maxFileBytes };
+}
+
 const isLocalMode = options.transport === 'stdio' || options.workspaceConfig !== undefined;
 if (isLocalMode && process.platform === 'win32' && process.env.HARNESS_ALLOW_WIN32_STDIO !== '1') {
   process.stderr.write(
@@ -59,7 +64,7 @@ if (options.transport === 'stdio') {
     const registry = await loadRegistryOrExit(options.workspaceConfig);
     // Every stdio client starts its own process, so task state persists only with an explicit
     // stateDir, which must then belong to this one process (the file lock enforces it).
-    const pool = new LocalWorkspacePool(registry.workspaces, options, undefined, registry.stateDir);
+    const pool = new LocalWorkspacePool(registry.workspaces, options, undefined, registry.stateDir, fileImportSettings(registry));
     // One stdio process serves one client, so its active-workspace preference is client-scoped.
     const router = new MultiLocalWorkspaceBackend(pool, 'client');
     backend = Object.assign(router, { close: () => pool.close() });
@@ -118,7 +123,7 @@ if (options.transport === 'stdio') {
   }
   const registry = await loadRegistryOrExit(options.workspaceConfig);
   const stateDir = registry.stateDir ?? defaultLocalStateDir();
-  const pool = new LocalWorkspacePool(registry.workspaces, options, undefined, stateDir);
+  const pool = new LocalWorkspacePool(registry.workspaces, options, undefined, stateDir, fileImportSettings(registry));
   const { host, port } = registry.http;
   const local = createLocalHttpApp(pool, registry.http, bearerToken);
   const server = createServer(local.app);

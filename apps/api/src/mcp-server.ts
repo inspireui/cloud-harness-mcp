@@ -105,6 +105,20 @@ export function createCloudHarnessServer(
     { instructions }
   );
 
+  const handle = (name: string, call: (input: Record<string, unknown>, signal: AbortSignal) => Promise<RunnerResponse>) =>
+    async (input: unknown, context: { mcpReq: { signal: AbortSignal } }): Promise<CallToolResult> => {
+      const args = input as Record<string, unknown>;
+      if (!backend.logToolCall) return resultToMcp(await call(args, context.mcpReq.signal));
+      const startedAt = performance.now();
+      let response: RunnerResponse | undefined;
+      try {
+        response = await call(args, context.mcpReq.signal);
+        return resultToMcp(response);
+      } finally {
+        backend.logToolCall(name, args, performance.now() - startedAt, response);
+      }
+    };
+
   for (const spec of TOOL_SPECS) {
     if (backend.supportsOperation && !backend.supportsOperation(spec.name)) continue;
     server.registerTool(
@@ -121,20 +135,25 @@ export function createCloudHarnessServer(
           openWorldHint: spec.openWorld
         }
       },
-      async (input, context) => {
-        if (!backend.logToolCall) {
-          return resultToMcp(await backend.call(spec.name, input as Record<string, unknown>, context.mcpReq.signal));
-        }
-        const startedAt = performance.now();
-        let response: RunnerResponse | undefined;
-        try {
-          response = await backend.call(spec.name, input as Record<string, unknown>, context.mcpReq.signal);
-          return resultToMcp(response);
-        } finally {
-          backend.logToolCall(spec.name, input as Record<string, unknown>, performance.now() - startedAt, response);
-        }
-      }
+      handle(spec.name, async (input, signal) => await backend.call(spec.name, input, signal))
     );
+  }
+  if (backend.callBackendTool) {
+    const callBackendTool = backend.callBackendTool.bind(backend);
+    for (const tool of backend.backendTools?.() ?? []) {
+      server.registerTool(
+        tool.name,
+        {
+          title: tool.title,
+          description: tool.description,
+          inputSchema: tool.inputSchema,
+          outputSchema: ToolResultSchema,
+          annotations: tool.annotations,
+          ...(tool._meta ? { _meta: tool._meta } : {})
+        },
+        handle(tool.name, async (input, signal) => await callBackendTool(tool.name, input, signal))
+      );
+    }
   }
   if (supportsSkillsExtension(backend)) registerSkillsExtension(server, backend);
   if (backend.events) registerEventsExtension(server, backend.events);

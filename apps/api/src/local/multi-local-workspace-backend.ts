@@ -1,11 +1,12 @@
 import { realpath, stat } from 'node:fs/promises';
 import type { RunnerOperation, RunnerResponse } from '@cloud-harness/contracts';
-import type { OperationBackend } from '../operation-backend.js';
+import type { BackendTool, OperationBackend } from '../operation-backend.js';
 import type { CliOptions } from '../cli-options.js';
 import { LOCAL_LONG_JOB_GUIDANCE, LOCAL_REGISTERED_GUIDANCE, LocalWorkspaceBackend } from './local-workspace-backend.js';
 import type { RegisteredLocalWorkspace } from './local-workspace-registry.js';
 import { LocalTaskStateFile } from './local-task-state.js';
 import { logLocalToolCall } from './local-call-log.js';
+import { FILES_IMPORT_TOOL_SPEC, LOCAL_FILE_IMPORT_GUIDANCE, defaultFileImportSettings, type FileImportSettings } from './local-file-import.js';
 import { isLocalToolAdvertised, unsupportedLocalReason, unsupportedLocalResponse } from './local-unsupported.js';
 
 type Member = {
@@ -57,7 +58,8 @@ export class LocalWorkspacePool {
     registry: RegisteredLocalWorkspace[],
     options: CliOptions,
     private readonly workerScriptPath?: string,
-    private readonly stateDir?: string
+    private readonly stateDir?: string,
+    private readonly fileImport: FileImportSettings = defaultFileImportSettings()
   ) {
     for (const entry of registry) {
       const gitPush = entry.gitPush ?? options.gitPush;
@@ -74,6 +76,7 @@ export class LocalWorkspacePool {
     const stateFile = this.stateDir ? LocalTaskStateFile.forWorkspace(this.stateDir, entry.workspaceId) : undefined;
     const backend = new LocalWorkspaceBackend(entry.canonicalRoot, options, this.workerScriptPath, entry.workspaceId, stateFile);
     backend.registered = true;
+    backend.fileImport = this.fileImport;
     return backend;
   }
 
@@ -171,7 +174,7 @@ export class MultiLocalWorkspaceBackend implements OperationBackend {
     return `This is a Cloud Harness local multi-workspace server. Registered persistent workspaces are already open: ${names}. `
       + `Call workspace_list to see their status. ${selection} `
       + 'Operations execute in the selected project folder with host-user permissions. Path confinement prevents tool path escapes; commands run with host authority. '
-      + LOCAL_REGISTERED_GUIDANCE + LOCAL_LONG_JOB_GUIDANCE;
+      + LOCAL_REGISTERED_GUIDANCE + LOCAL_FILE_IMPORT_GUIDANCE + LOCAL_LONG_JOB_GUIDANCE;
   }
 
   supportsOperation(operation: RunnerOperation): boolean {
@@ -182,7 +185,23 @@ export class MultiLocalWorkspaceBackend implements OperationBackend {
     return operation === 'workspace_close' ? REGISTERED_CLOSE_DESCRIPTION : undefined;
   }
 
-  logToolCall(operation: RunnerOperation, input: Record<string, unknown>, durationMs: number, response?: RunnerResponse): void {
+  backendTools(): BackendTool[] {
+    return [FILES_IMPORT_TOOL_SPEC];
+  }
+
+  /** Backend tools carry a workspaceId and run in that member, after the same root check as runner tools. */
+  async callBackendTool(name: string, input: Record<string, unknown>, signal?: AbortSignal): Promise<RunnerResponse> {
+    const selected = this.selectMember(input);
+    if ('failure' in selected) return selected.failure;
+    let member = selected.member;
+    if (!(await this.pool.rootAvailable(member))) {
+      return failure('UNAVAILABLE', `workspace "${member.entry.name}" root ${member.entry.configuredPath} is unavailable or no longer the registered directory; restore the mount, then retry`, true);
+    }
+    member = this.pool.get(member.entry.workspaceId)!;
+    return await member.backend.callBackendTool(name, { ...input, workspaceId: member.entry.workspaceId }, signal);
+  }
+
+  logToolCall(operation: RunnerOperation | string, input: Record<string, unknown>, durationMs: number, response?: RunnerResponse): void {
     const workspaceId = typeof input.workspaceId === 'string' ? input.workspaceId : this.resolveDefault()?.entry.workspaceId;
     logLocalToolCall(operation, workspaceId, durationMs, response);
   }
@@ -212,13 +231,9 @@ export class MultiLocalWorkspaceBackend implements OperationBackend {
       return await member.backend.call(operation, input, signal);
     }
 
-    const requested = typeof input.workspaceId === 'string' ? input.workspaceId : undefined;
-    let member = requested !== undefined ? this.pool.get(requested) : this.resolveDefault();
-    if (!member) {
-      if (requested !== undefined) return failure('NOT_FOUND', 'workspace not found');
-      const names = this.pool.list().map((m) => `${m.entry.name}=${m.entry.workspaceId}`).join(', ');
-      return failure('CONFLICT', `more than one local workspace is registered; pass workspaceId explicitly (${names})`);
-    }
+    const selected = this.selectMember(input);
+    if ('failure' in selected) return selected.failure;
+    let member = selected.member;
 
     if (operation === 'workspace_close') {
       // Every client of this server shares a registered root, so closing it would kill other
@@ -247,6 +262,16 @@ export class MultiLocalWorkspaceBackend implements OperationBackend {
     }
 
     return await member.backend.call(operation, { ...input, workspaceId: member.entry.workspaceId }, signal);
+  }
+
+  /** The explicitly requested member, else the default; never a guess between several. */
+  private selectMember(input: Record<string, unknown>): { member: Member } | { failure: RunnerResponse } {
+    const requested = typeof input.workspaceId === 'string' ? input.workspaceId : undefined;
+    const member = requested !== undefined ? this.pool.get(requested) : this.resolveDefault();
+    if (member) return { member };
+    if (requested !== undefined) return { failure: failure('NOT_FOUND', 'workspace not found') };
+    const names = this.pool.list().map((m) => `${m.entry.name}=${m.entry.workspaceId}`).join(', ');
+    return { failure: failure('CONFLICT', `more than one local workspace is registered; pass workspaceId explicitly (${names})`) };
   }
 
   private resolveDefault(): Member | undefined {

@@ -2,13 +2,22 @@ import { createHash, randomBytes } from 'node:crypto';
 import { join } from 'node:path';
 import { readdir, readFile } from 'node:fs/promises';
 import { applyGuidanceActivity, sanitizeAndAttributeProvenance, type GuidanceProfile, type RunnerOperation, type RunnerResponse } from '@cloud-harness/contracts';
-import type { OperationBackend } from '../operation-backend.js';
+import type { BackendTool, OperationBackend } from '../operation-backend.js';
 import type { CliOptions } from '../cli-options.js';
 import { LocalPathPolicy } from './local-path-policy.js';
 import { LocalWorkerClient } from './local-worker-client.js';
 import { LocalOperationManager } from './local-operation-manager.js';
 import type { LocalTaskStateFile } from './local-task-state.js';
 import { logLocalToolCall } from './local-call-log.js';
+import {
+  FILES_IMPORT_TOOL,
+  FILES_IMPORT_TOOL_SPEC,
+  FilesImportInputSchema,
+  LOCAL_FILE_IMPORT_GUIDANCE,
+  defaultFileImportSettings,
+  importFiles,
+  type FileImportSettings
+} from './local-file-import.js';
 import {
   isGitWorkTree,
   isLocalToolAdvertised,
@@ -43,6 +52,8 @@ export class LocalWorkspaceBackend implements OperationBackend {
   private gitRootCache: boolean | undefined;
   /** Set by the multi-workspace pool: a shared registered root never offers workspace_close. */
   registered = false;
+  /** files_import limits; the multi-workspace pool sets them from the workspace config. */
+  fileImport: FileImportSettings = defaultFileImportSettings();
 
   constructor(
     public readonly canonicalRoot: string,
@@ -60,7 +71,7 @@ export class LocalWorkspaceBackend implements OperationBackend {
   }
 
   getInstructions(): string {
-    return `This is a Cloud Harness local stdio workspace. Operations execute against the selected project folder (${this.canonicalRoot}) with host-user permissions. The workspace is already open (workspaceId: "${this.workspaceId}"). Path confinement prevents tool path escapes; commands run with host authority. ${LOCAL_LONG_JOB_GUIDANCE}`;
+    return `This is a Cloud Harness local stdio workspace. Operations execute against the selected project folder (${this.canonicalRoot}) with host-user permissions. The workspace is already open (workspaceId: "${this.workspaceId}"). Path confinement prevents tool path escapes; commands run with host authority. ${LOCAL_FILE_IMPORT_GUIDANCE}${LOCAL_LONG_JOB_GUIDANCE}`;
   }
 
   /** Whether the root was inside a Git work tree when first asked; tools/list uses the cached answer. */
@@ -73,7 +84,22 @@ export class LocalWorkspaceBackend implements OperationBackend {
     return isLocalToolAdvertised(operation, { selection: 'single', anyGitRoot: this.gitRoot });
   }
 
-  logToolCall(operation: RunnerOperation, input: Record<string, unknown>, durationMs: number, response?: RunnerResponse): void {
+  backendTools(): BackendTool[] {
+    return [FILES_IMPORT_TOOL_SPEC];
+  }
+
+  async callBackendTool(name: string, input: Record<string, unknown>, signal?: AbortSignal): Promise<RunnerResponse> {
+    this.lastActivityAt = Date.now();
+    const fail = (code: 'NOT_FOUND' | 'INVALID_INPUT', message: string): RunnerResponse => ({ ok: false, message, error: { code, message, retryable: false }, truncated: false });
+    if (name !== FILES_IMPORT_TOOL) return fail('NOT_FOUND', `tool ${name} not found`);
+    if (this.status === 'CLOSED') return fail('NOT_FOUND', 'workspace is closed');
+    if (input.workspaceId !== undefined && input.workspaceId !== this.workspaceId) return fail('NOT_FOUND', 'workspace not found');
+    const parsed = FilesImportInputSchema.safeParse(input);
+    if (!parsed.success) return fail('INVALID_INPUT', parsed.error.issues[0]?.message ?? 'invalid input');
+    return await importFiles(this.pathPolicy, parsed.data, this.fileImport, signal);
+  }
+
+  logToolCall(operation: RunnerOperation | string, input: Record<string, unknown>, durationMs: number, response?: RunnerResponse): void {
     logLocalToolCall(operation, typeof input.workspaceId === 'string' ? input.workspaceId : this.workspaceId, durationMs, response);
   }
 

@@ -36,6 +36,11 @@ const HttpSchema = z.object({
   limits: HttpLimitsSchema.default(() => HttpLimitsSchema.parse({}))
 }).strict();
 
+/** files_import: the largest file one download may write, enforced while it streams (default 50 MiB). */
+const FileImportSchema = z.object({
+  maxFileBytes: z.number().int().min(1_024).max(1_073_741_824).default(52_428_800)
+}).strict();
+
 const WorkspaceConfigSchema = z.object({
   version: z.literal(1),
   /**
@@ -44,11 +49,13 @@ const WorkspaceConfigSchema = z.object({
    */
   stateDir: z.string().min(1).refine(isAbsolute, 'stateDir must be absolute').optional(),
   http: HttpSchema.optional(),
+  fileImport: FileImportSchema.optional(),
   workspaces: z.record(AliasSchema, WorkspaceEntrySchema).refine((value) => Object.keys(value).length > 0, 'at least one workspace is required')
 }).strict();
 
 export type LocalHttpSettings = z.infer<typeof HttpSchema>;
 export type LocalHttpLimits = z.infer<typeof HttpLimitsSchema>;
+export type LocalFileImportConfig = z.infer<typeof FileImportSchema>;
 
 /** Device and inode of a root at registration; a remount or replaced directory changes them. */
 export type RootIdentity = { dev: number; ino: number };
@@ -66,6 +73,7 @@ export type RegisteredLocalWorkspace = {
 export type LocalWorkspaceRegistry = {
   workspaces: RegisteredLocalWorkspace[];
   http: LocalHttpSettings;
+  fileImport: LocalFileImportConfig;
   /** The configured `stateDir`, if any; each transport picks its own default. */
   stateDir?: string;
 };
@@ -128,5 +136,5 @@ export async function loadLocalWorkspaceRegistry(configPath: string): Promise<Lo
       ...(entry.gitPush !== undefined ? { gitPush: entry.gitPush } : {})
     });
   }
-  return { workspaces, http: config.http ?? HttpSchema.parse({}), ...(config.stateDir ? { stateDir: config.stateDir } : {}) };
+  return { workspaces, http: config.http ?? HttpSchema.parse({}), fileImport: config.fileImport ?? FileImportSchema.parse({}), ...(config.stateDir ? { stateDir: config.stateDir } : {}) };
 }

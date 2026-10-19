@@ -13,7 +13,7 @@ export const localStderrLogger = pino({ level: process.env.LOG_LEVEL ?? 'info' }
  * never arguments, output, or anything else a caller sent, so commands and file bodies stay out
  * of the journal.
  */
-export function logLocalToolCall(operation: RunnerOperation, workspaceId: string | undefined, durationMs: number, response?: RunnerResponse): void {
+export function logLocalToolCall(operation: RunnerOperation | string, workspaceId: string | undefined, durationMs: number, response?: RunnerResponse): void {
   const entry = {
     tool: operation,
     ...(workspaceId ? { workspaceId } : {}),

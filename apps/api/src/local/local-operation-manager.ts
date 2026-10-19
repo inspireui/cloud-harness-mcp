@@ -2,8 +2,10 @@ import { randomBytes } from 'node:crypto';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import type { LocalPathPolicy } from './local-path-policy.js';
 import { buildLocalEnvironment } from './local-environment.js';
+import type { LocalTaskStateFile, PersistedRecord } from './local-task-state.js';
 
-type ManagedStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'blocked';
+/** `interrupted`: the record was running or queued when the server stopped; it never resumes. */
+type ManagedStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'blocked' | 'interrupted';
 
 type Managed = {
   id: string;
@@ -22,7 +24,15 @@ type Managed = {
   timeoutMs?: number;
   maxBytes?: number;
   timer?: NodeJS.Timeout;
+  startedAt?: number;
+  endedAt?: number;
+  timedOut?: boolean;
+  signal?: string;
+  /** Operation handles (async exec_run and bash) record which tool started them. */
+  kind?: 'exec_run' | 'bash';
 };
+
+const TERMINAL: ReadonlySet<ManagedStatus> = new Set(['succeeded', 'failed', 'cancelled', 'blocked', 'interrupted']);
 
 const id = (prefix: string) => `${prefix}_${randomBytes(24).toString('base64url')}`;
 
@@ -105,16 +115,69 @@ export class LocalOperationManager {
   private readonly tasks = new Map<string, Managed>();
   private readonly shells = new Map<string, Managed>();
   private readonly sessions = new Map<string, Managed>();
+  private readonly operations = new Map<string, Managed>();
   private readonly idempotency = new Map<string, string>();
   private readonly retainedOutputBytes = 67_108_864;
 
+  /**
+   * With a `stateFile`, task and operation metadata (never output) is restored at construction and
+   * rewritten on every state change, so a restart reports earlier handles instead of NOT_FOUND.
+   */
   constructor(
     private readonly pathPolicy: LocalPathPolicy,
-    private readonly forwardedEnvNames: string[] = []
-  ) {}
+    private readonly forwardedEnvNames: string[] = [],
+    private readonly stateFile?: LocalTaskStateFile
+  ) {
+    for (const saved of stateFile?.load() ?? []) this.restore(saved);
+  }
+
+  private restore(saved: PersistedRecord): void {
+    const map = saved.id.startsWith('op_') ? this.operations : this.tasks;
+    const interrupted = saved.status === 'running' || saved.status === 'queued';
+    const record: Managed = {
+      id: saved.id,
+      workspaceId: saved.workspaceId,
+      output: Buffer.alloc(0),
+      offset: 0,
+      status: interrupted ? 'interrupted' : saved.status,
+      createdAt: saved.createdAt,
+      idempotencyKey: saved.idempotencyKey,
+      command: saved.command,
+      cwd: saved.cwd,
+      dependsOn: saved.dependsOn,
+      ...(saved.kind ? { kind: saved.kind } : {}),
+      ...(saved.exitCode !== undefined ? { exitCode: saved.exitCode } : {}),
+      ...(saved.startedAt !== undefined ? { startedAt: saved.startedAt } : {}),
+      ...(saved.endedAt !== undefined ? { endedAt: saved.endedAt } : interrupted ? { endedAt: Date.now() } : {}),
+      ...(saved.timedOut ? { timedOut: true } : {})
+    };
+    map.set(record.id, record);
+    // A repeated key still returns the earlier (now interrupted) handle, so a restart never runs a
+    // command twice behind the caller's back; the caller retries with a new key.
+    this.idempotency.set(record.idempotencyKey, record.id);
+  }
+
+  private persist(): void {
+    if (!this.stateFile) return;
+    this.stateFile.save([...this.tasks.values(), ...this.operations.values()].map((record) => ({
+      id: record.id,
+      workspaceId: record.workspaceId,
+      idempotencyKey: record.idempotencyKey,
+      command: record.command ?? '',
+      cwd: record.cwd ?? '',
+      status: record.status,
+      createdAt: record.createdAt,
+      dependsOn: record.dependsOn ?? [],
+      ...(record.kind ? { kind: record.kind } : {}),
+      ...(record.exitCode !== undefined ? { exitCode: record.exitCode } : {}),
+      ...(record.startedAt !== undefined ? { startedAt: record.startedAt } : {}),
+      ...(record.endedAt !== undefined ? { endedAt: record.endedAt } : {}),
+      ...(record.timedOut ? { timedOut: true } : {})
+    })));
+  }
 
   private records(workspaceId: string): Managed[] {
-    return [...this.tasks.values(), ...this.shells.values(), ...this.sessions.values()]
+    return [...this.tasks.values(), ...this.operations.values(), ...this.shells.values(), ...this.sessions.values()]
       .filter((record) => record.workspaceId === workspaceId)
       .sort((left, right) => left.createdAt - right.createdAt);
   }
@@ -165,15 +228,18 @@ export class LocalOperationManager {
     child.stdout.on('data', append);
     child.stderr.on('data', append);
 
-    child.on('close', (code) => {
+    child.on('close', (code, signal) => {
       if (record.timer) {
         clearTimeout(record.timer);
       }
       record.exitCode = code ?? 1;
+      if (signal) record.signal = String(signal);
+      record.endedAt ??= Date.now();
       if (record.status === 'running') {
         record.status = code === 0 ? 'succeeded' : 'failed';
       }
       this.reconcileQueued(record.workspaceId);
+      this.persist();
     });
 
     child.on('error', () => {
@@ -181,10 +247,12 @@ export class LocalOperationManager {
         clearTimeout(record.timer);
       }
       record.exitCode = 1;
+      record.endedAt ??= Date.now();
       if (record.status === 'running') {
         record.status = 'failed';
       }
       this.reconcileQueued(record.workspaceId);
+      this.persist();
     });
   }
 
@@ -440,6 +508,75 @@ export class LocalOperationManager {
     this.tasks.set(record.id, record);
     this.idempotency.set(mapKey, record.id);
     this.reconcileQueued(workspaceId);
+    this.persist();
+    return record;
+  }
+
+  /**
+   * Starts an async `exec_run`/`bash` command as an operation handle. It runs like a task (same
+   * spawn, timeout, and bounded output), but is addressed through operation_status, operation_wait,
+   * and operation_cancel with an `op_` ID, the shape the remote runner returns.
+   */
+  async startOperation(
+    workspaceId: string,
+    kind: 'exec_run' | 'bash',
+    command: string,
+    cwdInput?: string,
+    timeoutMs = 60_000,
+    maxBytes = 1_048_576
+  ): Promise<Managed> {
+    this.reserve(this.operations, workspaceId, 128);
+    const cwd = await this.pathPolicy.safeCwd(cwdInput);
+    const recordId = id('op');
+    const record: Managed = {
+      id: recordId,
+      workspaceId,
+      output: Buffer.alloc(0),
+      offset: 0,
+      status: 'queued',
+      createdAt: Date.now(),
+      idempotencyKey: `operation:${workspaceId}:${recordId}`,
+      command,
+      cwd,
+      timeoutMs,
+      maxBytes,
+      kind
+    };
+    this.operations.set(record.id, record);
+    this.startTask(record);
+    this.persist();
+    return record;
+  }
+
+  operation(workspaceId: string, operationId: string): Managed {
+    const record = this.operations.get(operationId);
+    if (!record || record.workspaceId !== workspaceId) {
+      throw new Error(`operation ${operationId} not found`);
+    }
+    return record;
+  }
+
+  hasOperation(operationId: string): boolean {
+    return this.operations.has(operationId);
+  }
+
+  cancelOperation(workspaceId: string, operationId: string): Managed {
+    const record = this.operation(workspaceId, operationId);
+    if (record.status !== 'running') return record;
+    terminateProcess(record.child);
+    record.status = 'cancelled';
+    record.endedAt = Date.now();
+    this.persist();
+    return record;
+  }
+
+  /** Resolves once the operation is terminal or `timeoutMs` elapses (or `signal` aborts). */
+  async waitOperation(workspaceId: string, operationId: string, timeoutMs: number, signal?: AbortSignal): Promise<Managed> {
+    const record = this.operation(workspaceId, operationId);
+    const deadline = Date.now() + timeoutMs;
+    while (!TERMINAL.has(record.status) && Date.now() < deadline && !signal?.aborted) {
+      await new Promise((resolve) => setTimeout(resolve, Math.min(200, Math.max(0, deadline - Date.now()))));
+    }
     return record;
   }
 
@@ -459,8 +596,10 @@ export class LocalOperationManager {
 
     child.stdin.end();
     record.status = 'running';
+    record.startedAt = Date.now();
     if (record.timeoutMs) {
       record.timer = setTimeout(() => {
+        record.timedOut = true;
         terminateProcess(record.child);
       }, record.timeoutMs);
     }
@@ -475,7 +614,7 @@ export class LocalOperationManager {
         record.status = 'blocked';
         continue;
       }
-      if (dependencies.some((dep) => ['failed', 'cancelled', 'blocked'].includes(dep!.status))) {
+      if (dependencies.some((dep) => ['failed', 'cancelled', 'blocked', 'interrupted'].includes(dep!.status))) {
         record.status = 'blocked';
         continue;
       }
@@ -514,7 +653,9 @@ export class LocalOperationManager {
     const record = this.task(workspaceId, taskId);
     if (record.status === 'queued') {
       record.status = 'cancelled';
+      record.endedAt = Date.now();
       this.reconcileQueued(workspaceId);
+      this.persist();
       return record;
     }
     if (record.status !== 'running') {
@@ -522,8 +663,28 @@ export class LocalOperationManager {
     }
     terminateProcess(record.child);
     record.status = 'cancelled';
+    record.endedAt = Date.now();
     this.reconcileQueued(workspaceId);
+    this.persist();
     return record;
+  }
+
+  /**
+   * Server shutdown: stops every process like `stopWorkspace`, but keeps task and operation
+   * records and saves them as `interrupted`, so the next start still reports them.
+   */
+  async shutdown(): Promise<void> {
+    const toTerminate: ChildProcessWithoutNullStreams[] = [];
+    const now = Date.now();
+    for (const record of [...this.tasks.values(), ...this.operations.values(), ...this.shells.values(), ...this.sessions.values()]) {
+      if (record.status === 'running' || record.status === 'queued') {
+        record.status = record.id.startsWith('task_') || record.id.startsWith('op_') ? 'interrupted' : 'cancelled';
+        record.endedAt = now;
+        if (record.child) toTerminate.push(record.child);
+      }
+    }
+    this.persist();
+    await Promise.all(toTerminate.map((c) => terminateProcess(c)));
   }
 
   async stopWorkspace(workspaceId: string): Promise<void> {
@@ -538,6 +699,9 @@ export class LocalOperationManager {
     for (const [recordId, record] of this.tasks) {
       if (record.workspaceId === workspaceId) this.tasks.delete(recordId);
     }
+    for (const [recordId, record] of this.operations) {
+      if (record.workspaceId === workspaceId) this.operations.delete(recordId);
+    }
     for (const [recordId, record] of this.shells) {
       if (record.workspaceId === workspaceId) this.shells.delete(recordId);
     }
@@ -547,6 +711,7 @@ export class LocalOperationManager {
     for (const key of this.idempotency.keys()) {
       if (key.includes(`:${workspaceId}:`)) this.idempotency.delete(key);
     }
+    this.persist();
   }
 
   view(record: Managed): {
@@ -556,6 +721,8 @@ export class LocalOperationManager {
     output: string;
     name?: string;
     dependsOn?: string[];
+    startedAt?: string;
+    endedAt?: string;
   } {
     return {
       id: record.id,
@@ -563,7 +730,9 @@ export class LocalOperationManager {
       ...(record.exitCode !== undefined ? { exitCode: record.exitCode } : {}),
       output: record.output.toString('utf8'),
       ...(record.name !== undefined ? { name: record.name } : {}),
-      ...(record.dependsOn !== undefined ? { dependsOn: record.dependsOn } : {})
+      ...(record.dependsOn !== undefined ? { dependsOn: record.dependsOn } : {}),
+      ...(record.startedAt !== undefined ? { startedAt: new Date(record.startedAt).toISOString() } : {}),
+      ...(record.endedAt !== undefined ? { endedAt: new Date(record.endedAt).toISOString() } : {})
     };
   }
 
@@ -584,7 +753,7 @@ export class LocalOperationManager {
   }
 
   viewSince(record: Managed, cursor?: string): {
-    data: { id: string; status: ManagedStatus; exitCode?: number; output: string; name?: string; dependsOn?: string[] };
+    data: ReturnType<LocalOperationManager['view']>;
     cursor: string;
     truncated: boolean;
   } {

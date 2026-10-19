@@ -106,11 +106,12 @@ export function createCloudHarnessServer(
   );
 
   for (const spec of TOOL_SPECS) {
+    if (backend.supportsOperation && !backend.supportsOperation(spec.name)) continue;
     server.registerTool(
       spec.name,
       {
         title: spec.title,
-        description: spec.description,
+        description: backend.describeOperation?.(spec.name) ?? spec.description,
         inputSchema: spec.inputSchema,
         outputSchema: ToolResultSchema,
         annotations: {
@@ -121,7 +122,17 @@ export function createCloudHarnessServer(
         }
       },
       async (input, context) => {
-        return resultToMcp(await backend.call(spec.name, input as Record<string, unknown>, context.mcpReq.signal));
+        if (!backend.logToolCall) {
+          return resultToMcp(await backend.call(spec.name, input as Record<string, unknown>, context.mcpReq.signal));
+        }
+        const startedAt = performance.now();
+        let response: RunnerResponse | undefined;
+        try {
+          response = await backend.call(spec.name, input as Record<string, unknown>, context.mcpReq.signal);
+          return resultToMcp(response);
+        } finally {
+          backend.logToolCall(spec.name, input as Record<string, unknown>, performance.now() - startedAt, response);
+        }
       }
     );
   }

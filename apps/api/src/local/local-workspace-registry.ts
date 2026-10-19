@@ -3,6 +3,7 @@ import { readFile, realpath, stat } from 'node:fs/promises';
 import { isAbsolute, relative, sep } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { z } from 'zod';
+import { defaultLocalStateDir } from './local-task-state.js';
 
 /**
  * Operator-owned registry of persistent local workspace roots. The file is the only way to
@@ -17,20 +18,35 @@ const WorkspaceEntrySchema = z.object({
   gitPush: z.boolean().optional()
 }).strict();
 
+/**
+ * Per-principal limits of the local HTTP endpoint. Every local client authenticates as the one
+ * owner, so several parallel chats share these; the defaults are higher than the remote API's
+ * (120/min, 8 in flight, 1 MiB) because one host user runs batches of long commands.
+ */
+const HttpLimitsSchema = z.object({
+  requestsPerMinute: z.number().int().min(1).max(100_000).default(600),
+  inFlight: z.number().int().min(1).max(1_024).default(32),
+  maxBodyBytes: z.number().int().min(65_536).max(67_108_864).default(4_194_304)
+}).strict();
+
 const HttpSchema = z.object({
   host: z.string().min(1).default('127.0.0.1'),
   port: z.number().int().min(1).max(65_535).default(3100),
   publicHosts: z.array(z.string().min(1)).default([]),
-  allowedOrigins: z.array(z.string().url()).default([])
+  allowedOrigins: z.array(z.string().url()).default([]),
+  limits: HttpLimitsSchema.default(() => HttpLimitsSchema.parse({}))
 }).strict();
 
 const WorkspaceConfigSchema = z.object({
   version: z.literal(1),
+  /** Where task metadata survives restarts; defaults to ~/.local/state/cloud-harness-local. */
+  stateDir: z.string().min(1).refine(isAbsolute, 'stateDir must be absolute').optional(),
   http: HttpSchema.optional(),
   workspaces: z.record(AliasSchema, WorkspaceEntrySchema).refine((value) => Object.keys(value).length > 0, 'at least one workspace is required')
 }).strict();
 
 export type LocalHttpSettings = z.infer<typeof HttpSchema>;
+export type LocalHttpLimits = z.infer<typeof HttpLimitsSchema>;
 
 /** Device and inode of a root at registration; a remount or replaced directory changes them. */
 export type RootIdentity = { dev: number; ino: number };
@@ -48,6 +64,7 @@ export type RegisteredLocalWorkspace = {
 export type LocalWorkspaceRegistry = {
   workspaces: RegisteredLocalWorkspace[];
   http: LocalHttpSettings;
+  stateDir: string;
 };
 
 /**
@@ -108,5 +125,5 @@ export async function loadLocalWorkspaceRegistry(configPath: string): Promise<Lo
       ...(entry.gitPush !== undefined ? { gitPush: entry.gitPush } : {})
     });
   }
-  return { workspaces, http: config.http ?? HttpSchema.parse({}) };
+  return { workspaces, http: config.http ?? HttpSchema.parse({}), stateDir: config.stateDir ?? defaultLocalStateDir() };
 }

@@ -147,15 +147,35 @@ describe('MultiLocalWorkspaceBackend', () => {
     expect((await router.call('tasks_status', { workspaceId: id('vault'), taskId })).ok).toBe(false);
   });
 
-  it('closes one workspace without touching its files or other workspaces, then reopens it with the same ID', async () => {
+  it('treats workspace_close on a shared registered root as a no-op that stops nothing', async () => {
     await writeFile(join(base, 'bwe', 'keep.txt'), 'persistent');
-    await router.call('workspace_set_active', { workspaceId: id('bwe') });
+    const other = new MultiLocalWorkspaceBackend(pool, 'explicit');
+    const task = await other.call('tasks_run', { workspaceId: id('bwe'), command: 'sleep 30', idempotencyKey: 'other-client-1', timeoutMs: 60_000 });
+    const taskId = (task.data as { taskId: string }).taskId;
+
     const closed = await router.call('workspace_close', { workspaceId: id('bwe') });
     expect(closed.ok).toBe(true);
+    expect(closed.message).toContain('shared');
+    expect(closed.data).toMatchObject({ workspaceId: id('bwe'), status: 'ACTIVE', shared: true, closed: false });
+
+    // Another client's task keeps running and the workspace stays usable.
+    expect(((await other.call('tasks_status', { workspaceId: id('bwe'), taskId })).data as { status: string }).status).toBe('running');
+    expect((await router.call('files_list', { workspaceId: id('bwe'), path: '.' })).ok).toBe(true);
+    expect(await readFile(join(base, 'bwe', 'keep.txt'), 'utf8')).toBe('persistent');
+    const listed = ((await router.call('workspace_list', {})).data as { workspaces: Listed[] }).workspaces;
+    expect(listed.find((w) => w.name === 'bwe')?.availableActions).not.toContain('workspace_close');
+    expect(router.describeOperation('workspace_close')).toContain('no-op');
+  });
+
+  it('reopens a stopped root with the same ID without touching its files', async () => {
+    await writeFile(join(base, 'bwe', 'keep.txt'), 'persistent');
+    await router.call('workspace_set_active', { workspaceId: id('bwe') });
+    // Only the server itself stops a registered root (for example at shutdown).
+    await pool.get(id('bwe'))!.backend.close();
     expect(await readFile(join(base, 'bwe', 'keep.txt'), 'utf8')).toBe('persistent');
     expect((await router.call('files_list', { workspaceId: id('bwe'), path: '.' })).ok).toBe(false);
     expect((await router.call('files_list', { workspaceId: id('vault'), path: '.' })).ok).toBe(true);
-    // Closing clears the active default instead of silently routing elsewhere.
+    // A stopped active root is never used as the default instead of silently routing elsewhere.
     expect((await router.call('files_list', { path: '.' })).error?.code).toBe('CONFLICT');
     expect((await router.call('workspace_set_active', { workspaceId: id('bwe') })).error?.code).toBe('CONFLICT');
 
@@ -204,22 +224,22 @@ describe('MultiLocalWorkspaceBackend', () => {
     expect((caps.data as { capabilities: { gitPush: boolean; gitNetwork: boolean } }).capabilities).toMatchObject({ gitPush: true, gitNetwork: true });
   });
 
-  it('routes github tools by workspaceId to the structured local capability error', async () => {
-    await router.call('workspace_close', { workspaceId: id('vault') });
+  it('routes github tools by workspaceId to the structured local capability error naming gh', async () => {
     const result = await router.call('github_read', { workspaceId: id('bwe'), action: 'pr_list' });
     expect(result.error?.code).toBe('REPOSITORY_OPERATION_NOT_AUTHORIZED');
     expect(result.message).toContain('unsupported in local mode');
+    expect(result.message).toContain('`gh` CLI through exec_run');
   });
 
   it('reports a closed root through workspace_status so clients can recover it', async () => {
-    await router.call('workspace_close', { workspaceId: id('bwe') });
+    await pool.get(id('bwe'))!.backend.close();
     const status = await router.call('workspace_status', { workspaceId: id('bwe') });
     expect(status.ok).toBe(true);
     expect(status.data).toMatchObject({ status: 'CLOSED', name: 'bwe', availableActions: ['workspace_recover'] });
   });
 
   it('keeps the first backend when concurrent recovers race, so no live backend is orphaned', async () => {
-    await router.call('workspace_close', { workspaceId: id('bwe') });
+    await pool.get(id('bwe'))!.backend.close();
     const [first, second] = await Promise.all([
       router.call('workspace_recover', { workspaceId: id('bwe'), mode: 'resume' }),
       new MultiLocalWorkspaceBackend(pool, 'explicit').call('workspace_recover', { workspaceId: id('bwe'), mode: 'resume' })

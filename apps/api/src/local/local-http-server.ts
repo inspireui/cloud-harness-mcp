@@ -9,7 +9,6 @@ import { MultiLocalWorkspaceBackend, type LocalWorkspacePool } from './multi-loc
 import type { LocalHttpSettings } from './local-workspace-registry.js';
 
 const LOCAL_CLIENT_ID = 'local-owner';
-const MAX_BODY_BYTES = 1_048_576;
 
 type AuthenticatedRequest = Request & { auth?: AuthInfo };
 
@@ -60,8 +59,12 @@ export function createLocalHttpApp(pool: LocalWorkspacePool, settings: LocalHttp
   const app = express();
   app.disable('x-powered-by');
   app.get('/healthz', (_request, response) => response.json({ status: 'ok' }));
-  app.use('/mcp', requestSecurity(security), preAuthRequestLimits(), localBearerAuth(bearerToken), principalRequestLimits());
-  app.use('/mcp', express.json({ limit: MAX_BODY_BYTES, strict: true }));
+  // The configured limits (`http.limits`) apply to the single local owner. The pre-auth limiter
+  // never admits less than the remote API's own floor, so raising the owner limits is not undone by it.
+  const { requestsPerMinute, inFlight, maxBodyBytes } = settings.limits;
+  const preAuth = { requestsPerMinute: Math.max(1_000, requestsPerMinute), inFlight: Math.max(32, inFlight) };
+  app.use('/mcp', requestSecurity(security), preAuthRequestLimits(preAuth), localBearerAuth(bearerToken), principalRequestLimits(1_000, { requestsPerMinute, inFlight }));
+  app.use('/mcp', express.json({ limit: maxBodyBytes, strict: true }));
   app.all('/mcp', async (request: Request, response: Response) => {
     if (request.method === 'POST' && !request.is('application/json')) {
       response.status(415).json({ error: 'unsupported_media_type' });

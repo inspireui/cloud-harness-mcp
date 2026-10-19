@@ -56,7 +56,7 @@ if (options.transport === 'stdio') {
   let backend: OperationBackend & { close(): Promise<void> };
   if (options.workspaceConfig) {
     const registry = await loadRegistryOrExit(options.workspaceConfig);
-    const pool = new LocalWorkspacePool(registry.workspaces, options);
+    const pool = new LocalWorkspacePool(registry.workspaces, options, undefined, registry.stateDir);
     // One stdio process serves one client, so its active-workspace preference is client-scoped.
     const router = new MultiLocalWorkspaceBackend(pool, 'client');
     backend = Object.assign(router, { close: () => pool.close() });
@@ -114,7 +114,7 @@ if (options.transport === 'stdio') {
     process.exit(1);
   }
   const registry = await loadRegistryOrExit(options.workspaceConfig);
-  const pool = new LocalWorkspacePool(registry.workspaces, options);
+  const pool = new LocalWorkspacePool(registry.workspaces, options, undefined, registry.stateDir);
   const { host, port } = registry.http;
   const local = createLocalHttpApp(pool, registry.http, bearerToken);
   const server = createServer(local.app);
@@ -122,7 +122,7 @@ if (options.transport === 'stdio') {
     apiLogger.warn({ host }, 'Local multi-workspace MCP is bound to a non-loopback address: anyone who can reach it with the bearer token gets host-user execution, and plain HTTP sends the token in cleartext; put it behind TLS');
   }
   server.listen(port, host, () =>
-    apiLogger.info({ host, port, workspaces: registry.workspaces.length }, 'Local multi-workspace MCP listening')
+    apiLogger.info({ host, port, workspaces: registry.workspaces.length, limits: registry.http.limits, stateDir: registry.stateDir }, 'Local multi-workspace MCP listening')
   );
 
   let shuttingDown = false;

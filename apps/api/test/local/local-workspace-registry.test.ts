@@ -1,5 +1,5 @@
 import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { WorkspaceIdSchema } from '@cloud-harness/contracts';
@@ -38,7 +38,30 @@ describe('local workspace registry', () => {
     expect(new Set(first.workspaces.map((w) => w.workspaceId)).size).toBe(4);
     expect(first.workspaces[1]?.gitNetwork).toBe(true);
     expect(first.workspaces[3]?.gitPush).toBe(true);
-    expect(first.http).toEqual({ host: '127.0.0.1', port: 3100, publicHosts: [], allowedOrigins: [] });
+    expect(first.http).toEqual({
+      host: '127.0.0.1',
+      port: 3100,
+      publicHosts: [],
+      allowedOrigins: [],
+      limits: { requestsPerMinute: 600, inFlight: 32, maxBodyBytes: 4_194_304 }
+    });
+    expect(first.stateDir).toBe(join(homedir(), '.local', 'state', 'cloud-harness-local'));
+  });
+
+  it('reads HTTP limits and the state directory, filling unset limits with the local defaults', async () => {
+    await write([
+      'version: 1',
+      `stateDir: ${join(base, 'state')}`,
+      'workspaces:',
+      `  bwe:\n    path: ${join(base, 'bwe')}`,
+      'http:',
+      '  limits:',
+      '    requestsPerMinute: 2000',
+      '    maxBodyBytes: 8388608'
+    ].join('\n'));
+    const registry = await loadLocalWorkspaceRegistry(configPath);
+    expect(registry.http.limits).toEqual({ requestsPerMinute: 2000, inFlight: 32, maxBodyBytes: 8_388_608 });
+    expect(registry.stateDir).toBe(join(base, 'state'));
   });
 
   it('accepts JSON and resolves a symlinked path to its canonical root', async () => {
@@ -63,7 +86,11 @@ describe('local workspace registry', () => {
     ['missing version', 'workspaces:\n  a:\n    path: /tmp'],
     ['no workspaces', 'version: 1\nworkspaces: {}'],
     ['duplicate names', 'version: 1\nworkspaces:\n  a:\n    path: /tmp\n  a:\n    path: /var'],
-    ['YAML aliases', 'version: 1\nworkspaces:\n  a: &x\n    path: /tmp\n  b: *x']
+    ['YAML aliases', 'version: 1\nworkspaces:\n  a: &x\n    path: /tmp\n  b: *x'],
+    ['unknown limit', 'version: 1\nworkspaces:\n  a:\n    path: /tmp\nhttp:\n  limits:\n    burst: 5'],
+    ['zero in-flight limit', 'version: 1\nworkspaces:\n  a:\n    path: /tmp\nhttp:\n  limits:\n    inFlight: 0'],
+    ['body limit above 64 MiB', 'version: 1\nworkspaces:\n  a:\n    path: /tmp\nhttp:\n  limits:\n    maxBodyBytes: 134217728'],
+    ['relative stateDir', 'version: 1\nstateDir: state\nworkspaces:\n  a:\n    path: /tmp']
   ])('rejects %s', (_label, source) => {
     expect(() => parseLocalWorkspaceConfig(source)).toThrow();
   });

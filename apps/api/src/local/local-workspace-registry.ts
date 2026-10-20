@@ -17,20 +17,45 @@ const WorkspaceEntrySchema = z.object({
   gitPush: z.boolean().optional()
 }).strict();
 
+/**
+ * Per-principal limits of the local HTTP endpoint. Every local client authenticates as the one
+ * owner, so several parallel chats share these; the defaults are higher than the remote API's
+ * (120/min, 8 in flight, 1 MiB) because one host user runs batches of long commands.
+ */
+const HttpLimitsSchema = z.object({
+  requestsPerMinute: z.number().int().min(1).max(100_000).default(600),
+  inFlight: z.number().int().min(1).max(1_024).default(32),
+  maxBodyBytes: z.number().int().min(65_536).max(67_108_864).default(4_194_304)
+}).strict();
+
 const HttpSchema = z.object({
   host: z.string().min(1).default('127.0.0.1'),
   port: z.number().int().min(1).max(65_535).default(3100),
   publicHosts: z.array(z.string().min(1)).default([]),
-  allowedOrigins: z.array(z.string().url()).default([])
+  allowedOrigins: z.array(z.string().url()).default([]),
+  limits: HttpLimitsSchema.default(() => HttpLimitsSchema.parse({}))
+}).strict();
+
+/** files_import: the largest file one download may write, enforced while it streams (default 50 MiB). */
+const FileImportSchema = z.object({
+  maxFileBytes: z.number().int().min(1_024).max(1_073_741_824).default(52_428_800)
 }).strict();
 
 const WorkspaceConfigSchema = z.object({
   version: z.literal(1),
+  /**
+   * Where task metadata survives restarts. HTTP mode defaults to ~/.local/state/cloud-harness-local;
+   * stdio mode persists only when this is set, because every stdio client starts its own process.
+   */
+  stateDir: z.string().min(1).refine(isAbsolute, 'stateDir must be absolute').optional(),
   http: HttpSchema.optional(),
+  fileImport: FileImportSchema.optional(),
   workspaces: z.record(AliasSchema, WorkspaceEntrySchema).refine((value) => Object.keys(value).length > 0, 'at least one workspace is required')
 }).strict();
 
 export type LocalHttpSettings = z.infer<typeof HttpSchema>;
+export type LocalHttpLimits = z.infer<typeof HttpLimitsSchema>;
+export type LocalFileImportConfig = z.infer<typeof FileImportSchema>;
 
 /** Device and inode of a root at registration; a remount or replaced directory changes them. */
 export type RootIdentity = { dev: number; ino: number };
@@ -48,6 +73,9 @@ export type RegisteredLocalWorkspace = {
 export type LocalWorkspaceRegistry = {
   workspaces: RegisteredLocalWorkspace[];
   http: LocalHttpSettings;
+  fileImport: LocalFileImportConfig;
+  /** The configured `stateDir`, if any; each transport picks its own default. */
+  stateDir?: string;
 };
 
 /**
@@ -108,5 +136,5 @@ export async function loadLocalWorkspaceRegistry(configPath: string): Promise<Lo
       ...(entry.gitPush !== undefined ? { gitPush: entry.gitPush } : {})
     });
   }
-  return { workspaces, http: config.http ?? HttpSchema.parse({}) };
+  return { workspaces, http: config.http ?? HttpSchema.parse({}), fileImport: config.fileImport ?? FileImportSchema.parse({}), ...(config.stateDir ? { stateDir: config.stateDir } : {}) };
 }

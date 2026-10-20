@@ -23,10 +23,26 @@ operator-registered folder; no tool can add one.
   it, so pass `workspaceId` on every call there.
 - Retryable `UNAVAILABLE` (and `rootAvailable: false`) means the folder vanished
   or was replaced, for example a dropped mount. That workspace still answers
-  `workspace_status` and `workspace_close`; retry other tools after the operator
-  restores it.
-- `workspace_close` stops that folder's processes and never deletes files;
-  `workspace_recover` reopens it with the same ID.
+  `workspace_status`; retry other tools after the operator restores it.
+- Do not close a local workspace when you finish. On a single-folder server
+  `workspace_close` stops that folder's processes and never deletes files. On a
+  multi-folder server every client shares the registered folders, so
+  `workspace_close` is a no-op (`shared: true`, `closed: false`) that stops
+  nothing; cancel your own tasks, shells, sessions, and operations instead.
+- Local servers list only the tools they can serve. Agents, knowledge,
+  artifacts, packages, model profiles, secrets, `github_*`, `git_pull`,
+  `git_push`, `git_identity_*`, `skill_suggest`, `workspace_finalize`, and
+  (when no folder is a Git work tree) `worktrees_*` are left out; calling one
+  fails with `Tool <name> not found` (reconnect if your list is stale). Use
+  `gh` or `git push` through `exec_run`, or a CLI agent run with `tasks_run`.
+- Long jobs: `exec_run`/`bash` stop at `timeoutMs` (default 60 s, max 300 s),
+  even with `async: true`, which only frees the call (`op_` handle for
+  `operation_wait`, at most 300 s per call). For anything longer use
+  `tasks_run` with a unique `idempotencyKey` and explicit `timeoutMs`, and poll
+  `tasks_status`. After a server restart a running handle reports
+  `interrupted` (operations: `failed` with `RUNNER_RESTARTED`), its output is
+  gone, and repeating its key in `tasks_run` returns `RUNNER_RESTARTED`: start
+  it again with a new key.
 
 ## Result envelope
 

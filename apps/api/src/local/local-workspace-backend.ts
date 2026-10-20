@@ -1,14 +1,45 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { join } from 'node:path';
 import { readdir, readFile } from 'node:fs/promises';
-import { applyGuidanceActivity, isModelToolOperation, sanitizeAndAttributeProvenance, type GuidanceProfile, type RunnerOperation, type RunnerResponse } from '@cloud-harness/contracts';
-import type { OperationBackend } from '../operation-backend.js';
+import { applyGuidanceActivity, sanitizeAndAttributeProvenance, type GuidanceProfile, type RunnerOperation, type RunnerResponse } from '@cloud-harness/contracts';
+import type { BackendTool, OperationBackend } from '../operation-backend.js';
 import type { CliOptions } from '../cli-options.js';
 import { LocalPathPolicy } from './local-path-policy.js';
 import { LocalWorkerClient } from './local-worker-client.js';
 import { LocalOperationManager } from './local-operation-manager.js';
+import type { LocalTaskStateFile } from './local-task-state.js';
+import { logLocalToolCall } from './local-call-log.js';
+import {
+  FILES_IMPORT_TOOL,
+  FILES_IMPORT_TOOL_SPEC,
+  FilesImportInputSchema,
+  LOCAL_FILE_IMPORT_GUIDANCE,
+  defaultFileImportSettings,
+  importFiles,
+  type FileImportSettings
+} from './local-file-import.js';
+import {
+  isGitWorkTree,
+  isLocalToolAdvertised,
+  unimplementedLocalGitReason,
+  unsupportedLocalReason,
+  unsupportedLocalResponse
+} from './local-unsupported.js';
 
 const opaqueId = (prefix: string) => `${prefix}_${randomBytes(24).toString('base64url')}`;
+
+/** operation_wait never blocks longer than its schema maximum. */
+const OPERATION_WAIT_MAX_MS = 300_000;
+
+/** Shared by the single-root and multi-root local servers. */
+export const LOCAL_LONG_JOB_GUIDANCE = 'exec_run and bash block for at most their timeoutMs (default 60000, max 300000). '
+  + 'For anything longer than 300 s use tasks_run (unique idempotencyKey, explicit timeoutMs) and poll tasks_status with its cursor; '
+  + 'async: true on exec_run/bash only frees the call while a command of up to 300 s runs, then operation_wait collects it. '
+  + 'Remote-only tools (agents, knowledge, artifacts, packages, model profiles, GitHub broker) are not offered here and calls to them answer "tool not found"; '
+  + 'use the gh CLI through exec_run for GitHub and tasks_run with a CLI agent for sub-agents.';
+
+/** Only for the pre-registered roots of a workspace config, which clients cannot close. */
+export const LOCAL_REGISTERED_GUIDANCE = 'Do not call workspace_close when finished: local workspaces are pre-registered and stay open. ';
 
 export class LocalWorkspaceBackend implements OperationBackend {
   public readonly workspaceId: string;
@@ -18,23 +49,62 @@ export class LocalWorkspaceBackend implements OperationBackend {
   private readonly pathPolicy: LocalPathPolicy;
   private readonly workerClient: LocalWorkerClient;
   private readonly operationManager: LocalOperationManager;
+  private gitRootCache: boolean | undefined;
+  /** Set by the multi-workspace pool: a shared registered root never offers workspace_close. */
+  registered = false;
+  /** files_import limits; the multi-workspace pool sets them from the workspace config. */
+  fileImport: FileImportSettings = defaultFileImportSettings();
 
   constructor(
     public readonly canonicalRoot: string,
     public readonly options: CliOptions,
     workerScriptPath?: string,
-    workspaceId?: string
+    workspaceId?: string,
+    stateFile?: LocalTaskStateFile
   ) {
     this.workspaceId = workspaceId ?? opaqueId('ws_local');
     this.createdAt = Date.now();
     this.lastActivityAt = Date.now();
     this.pathPolicy = new LocalPathPolicy(canonicalRoot);
     this.workerClient = new LocalWorkerClient(canonicalRoot, workerScriptPath);
-    this.operationManager = new LocalOperationManager(this.pathPolicy, options.env);
+    this.operationManager = new LocalOperationManager(this.pathPolicy, options.env, stateFile);
   }
 
   getInstructions(): string {
-    return `This is a Cloud Harness local stdio workspace. Operations execute against the selected project folder (${this.canonicalRoot}) with host-user permissions. The workspace is already open (workspaceId: "${this.workspaceId}"). Path confinement prevents tool path escapes; commands run with host authority.`;
+    return `This is a Cloud Harness local stdio workspace. Operations execute against the selected project folder (${this.canonicalRoot}) with host-user permissions. The workspace is already open (workspaceId: "${this.workspaceId}"). Path confinement prevents tool path escapes; commands run with host authority. ${LOCAL_FILE_IMPORT_GUIDANCE}${LOCAL_LONG_JOB_GUIDANCE}`;
+  }
+
+  /** Whether the root was inside a Git work tree when first asked; tools/list uses the cached answer. */
+  get gitRoot(): boolean {
+    this.gitRootCache ??= isGitWorkTree(this.canonicalRoot);
+    return this.gitRootCache;
+  }
+
+  supportsOperation(operation: RunnerOperation): boolean {
+    return isLocalToolAdvertised(operation, { selection: 'single', anyGitRoot: this.gitRoot });
+  }
+
+  backendTools(): BackendTool[] {
+    return [FILES_IMPORT_TOOL_SPEC];
+  }
+
+  async callBackendTool(name: string, input: Record<string, unknown>, signal?: AbortSignal): Promise<RunnerResponse> {
+    this.lastActivityAt = Date.now();
+    const fail = (code: 'NOT_FOUND' | 'INVALID_INPUT', message: string): RunnerResponse => ({ ok: false, message, error: { code, message, retryable: false }, truncated: false });
+    if (name !== FILES_IMPORT_TOOL) return fail('NOT_FOUND', `tool ${name} not found`);
+    if (this.status === 'CLOSED') return fail('NOT_FOUND', 'workspace is closed');
+    if (input.workspaceId !== undefined && input.workspaceId !== this.workspaceId) return fail('NOT_FOUND', 'workspace not found');
+    const parsed = FilesImportInputSchema.safeParse(input);
+    if (!parsed.success) return fail('INVALID_INPUT', parsed.error.issues[0]?.message ?? 'invalid input');
+    return await importFiles(this.pathPolicy, parsed.data, this.fileImport, signal);
+  }
+
+  logToolCall(operation: RunnerOperation | string, input: Record<string, unknown>, durationMs: number, response?: RunnerResponse): void {
+    logLocalToolCall(operation, typeof input.workspaceId === 'string' ? input.workspaceId : this.workspaceId, durationMs, response);
+  }
+
+  hasOperation(operationId: string): boolean {
+    return this.operationManager.hasOperation(operationId);
   }
 
   get closed(): boolean {
@@ -54,7 +124,7 @@ export class LocalWorkspaceBackend implements OperationBackend {
       leaseState: this.status === 'ACTIVE' ? 'ACTIVE' : 'EXPIRED',
       canRenewLease: false,
       availableActions: this.status === 'ACTIVE'
-        ? ['workspace_lease_renew', 'workspace_recover', 'workspace_close', 'workspace_context', 'workspace_finalize']
+        ? ['workspace_lease_renew', 'workspace_recover', ...(this.registered ? [] : ['workspace_close']), 'workspace_context']
         : []
     };
   }
@@ -129,6 +199,12 @@ export class LocalWorkspaceBackend implements OperationBackend {
     await this.operationManager.stopWorkspace(this.workspaceId);
   }
 
+  /** Server shutdown: stops processes but keeps task records, saved as interrupted. */
+  async shutdown(): Promise<void> {
+    this.status = 'CLOSED';
+    await this.operationManager.shutdown();
+  }
+
   async call(
     operation: RunnerOperation,
     input: Record<string, unknown>,
@@ -153,14 +229,12 @@ export class LocalWorkspaceBackend implements OperationBackend {
       return { ok: false, message, error: { code: 'INVALID_INPUT', message, retryable: false }, truncated: false };
     }
 
-    if (operation.startsWith('packages_')) {
-      const message = `${operation} is unsupported in local mode because managed toolbox packages need the remote runner's isolated builder and release store; install project tools in the workspace instead`;
-      return { ok: false, message, error: { code: 'INVALID_INPUT', message, retryable: false }, truncated: false };
-    }
-
-    if (isModelToolOperation(operation)) {
-      const message = `${operation} is unsupported in local mode because model profiles live in the remote runner; use the remote MCP endpoint or the Dashboard`;
-      return { ok: false, message, error: { code: 'INVALID_INPUT', message, retryable: false }, truncated: false };
+    // GitHub tools keep their structured capability error below; every other remote-only tool is
+    // refused here with its local alternative instead of reaching the worker.
+    const unsupported = operation === 'github_read' || operation === 'github_action' ? undefined : unsupportedLocalReason(operation);
+    if (unsupported) return unsupportedLocalResponse(operation, unsupported);
+    if (operation === 'workspace_set_active') {
+      return unsupportedLocalResponse(operation, `this server has exactly one workspace; pass workspaceId "${this.workspaceId}"`);
     }
 
     if (operation === 'workspace_open') {
@@ -170,31 +244,6 @@ export class LocalWorkspaceBackend implements OperationBackend {
         error: {
           code: 'INVALID_INPUT',
           message: 'workspace_open is unsupported in local stdio mode because the workspace is selected at startup via --workspace',
-          retryable: false
-        },
-        truncated: false
-      };
-    }
-
-    if (['artifacts_snapshot', 'artifacts_list', 'artifacts_read', 'artifacts_restore', 'artifacts_delete'].includes(operation)) {
-      return {
-        ok: false,
-        message: `${operation} is unsupported in local stdio mode because retained artifacts require remote runner storage`,
-        error: {
-          code: 'INVALID_INPUT',
-          message: `${operation} is unsupported in local stdio mode because retained artifacts require remote runner storage`,
-          retryable: false
-        },
-        truncated: false
-      };
-    }
-    if (operation === 'secrets_list') {
-      return {
-        ok: false,
-        message: 'secrets_list is unsupported in local stdio mode because retained environment secrets require remote runner storage',
-        error: {
-          code: 'INVALID_INPUT',
-          message: 'secrets_list is unsupported in local stdio mode because retained environment secrets require remote runner storage',
           retryable: false
         },
         truncated: false
@@ -516,6 +565,10 @@ export class LocalWorkspaceBackend implements OperationBackend {
       };
     }
 
+    if (operation === 'operation_status' || operation === 'operation_wait' || operation === 'operation_cancel') {
+      return await this.callOperation(operation, input, signal);
+    }
+
     if (input.workspaceId !== this.workspaceId) {
       return {
         ok: false,
@@ -536,12 +589,13 @@ export class LocalWorkspaceBackend implements OperationBackend {
       const requiredCapability = operation === 'github_read'
         ? (scope ? `repository.${scope}Read` : 'repository.read')
         : `repository.${scope ?? 'issues'}Write`;
+      const message = `${operation} is unsupported in local mode because ${unsupportedLocalReason(operation)}`;
       return {
         ok: false,
-        message: `${operation} is unsupported in local mode`,
+        message,
         error: {
           code: 'REPOSITORY_OPERATION_NOT_AUTHORIZED',
-          message: `${operation} is unsupported in local mode`,
+          message,
           retryable: false,
           operation,
           repository: `local://${this.canonicalRoot}`,
@@ -565,6 +619,27 @@ export class LocalWorkspaceBackend implements OperationBackend {
           },
           truncated: false
         };
+      }
+      if (input.async === true) {
+        try {
+          const record = await this.operationManager.startOperation(
+            this.workspaceId,
+            operation,
+            String(input.command || ''),
+            typeof input.cwd === 'string' ? input.cwd : undefined,
+            typeof input.timeoutMs === 'number' ? input.timeoutMs : 60_000,
+            typeof input.maxOutputBytes === 'number' ? input.maxOutputBytes : 1_048_576
+          );
+          return {
+            ok: true,
+            message: 'Command started in background',
+            data: { operationId: record.id, status: 'running' },
+            truncated: false
+          };
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : `${operation} failed`;
+          return { ok: false, message: msg, error: { code: 'INVALID_INPUT', message: msg, retryable: false }, truncated: false };
+        }
       }
       try {
         const result = await this.operationManager.execRun(
@@ -733,6 +808,18 @@ export class LocalWorkspaceBackend implements OperationBackend {
           typeof input.maxOutputBytes === 'number' ? input.maxOutputBytes : 1_048_576,
           Array.isArray(input.dependsOn) ? (input.dependsOn as string[]) : []
         );
+        if (record.status === 'interrupted') {
+          // A new task never starts interrupted: the key named a task from before a restart, which
+          // is never re-run behind the caller's back, so say so instead of answering "queued".
+          const msg = `task ${record.id} with this idempotencyKey was interrupted by a server restart; retry with a new idempotencyKey`;
+          return {
+            ok: false,
+            message: msg,
+            data: { taskId: record.id, status: record.status },
+            error: { code: 'RUNNER_RESTARTED', message: msg, retryable: true },
+            truncated: false
+          };
+        }
         return {
           ok: true,
           message: 'Task queued',
@@ -820,6 +907,10 @@ export class LocalWorkspaceBackend implements OperationBackend {
       }
     }
 
+    if (operation.startsWith('worktrees_') && !isGitWorkTree(this.canonicalRoot)) {
+      return unsupportedLocalResponse(operation, `the workspace root ${this.canonicalRoot} is not inside a Git work tree; run \`git worktree add\` through exec_run with cwd set to a repository inside the workspace`);
+    }
+
     if (operation === 'git_push') {
       if (!this.options.gitPush) {
         return {
@@ -838,7 +929,141 @@ export class LocalWorkspaceBackend implements OperationBackend {
       }
     }
 
+    // The policy gates above answer first; an allowed git_pull/git_push still has no worker handler.
+    const unimplemented = unimplementedLocalGitReason(operation);
+    if (unimplemented) return unsupportedLocalResponse(operation, unimplemented);
+
     // Forward file, search, symbol, git, memory, hook, deployment operations to local worker
     return await this.workerClient.call(operation, input, signal);
   }
+
+  /**
+   * operation_status, operation_wait, and operation_cancel over this workspace's async exec_run and
+   * bash handles, with the remote runner's response shapes and statuses.
+   */
+  private async callOperation(operation: 'operation_status' | 'operation_wait' | 'operation_cancel', input: Record<string, unknown>, signal?: AbortSignal): Promise<RunnerResponse> {
+    const operationId = String(input.operationId || '');
+    let record: ReturnType<LocalOperationManager['operation']>;
+    try {
+      record = this.operationManager.operation(this.workspaceId, operationId);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'operation not found';
+      return { ok: false, message: msg, error: { code: 'NOT_FOUND', message: msg, retryable: false }, truncated: false };
+    }
+
+    if (operation === 'operation_cancel') {
+      record = this.operationManager.cancelOperation(this.workspaceId, operationId);
+      return {
+        ok: true,
+        message: 'Operation cancelled',
+        data: { operationId: record.id, status: operationStatus(record.status) },
+        truncated: false
+      };
+    }
+
+    if (operation === 'operation_wait') {
+      const timeoutMs = Math.min(typeof input.timeoutMs === 'number' ? input.timeoutMs : 60_000, OPERATION_WAIT_MAX_MS);
+      const startTime = Date.now();
+      record = await this.operationManager.waitOperation(this.workspaceId, operationId, timeoutMs, signal);
+      const status = operationStatus(record.status);
+      if (status === 'running' && signal?.aborted) {
+        // The client went away before the deadline; that is not a timeout.
+        return {
+          ok: false,
+          message: 'operation_wait aborted by the client',
+          error: { code: 'CANCELLED', message: 'operation_wait aborted by the client; the operation keeps running', retryable: true },
+          truncated: false
+        };
+      }
+      if (status === 'running') {
+        return {
+          ok: false,
+          message: 'Operation wait timed out',
+          error: {
+            code: 'TIMEOUT',
+            message: 'Operation did not reach terminal state within timeout',
+            retryable: true,
+            retryAfterMs: 2000,
+            deadline: new Date(startTime + timeoutMs).toISOString()
+          },
+          truncated: false
+        };
+      }
+      const error = operationError(record);
+      return {
+        ok: status === 'completed',
+        message: `Operation ${status}`,
+        data: {
+          operationId: record.id,
+          status,
+          result: this.operationResult(record),
+          finishedAt: record.endedAt !== undefined ? new Date(record.endedAt).toISOString() : undefined
+        },
+        ...(error ? { error } : {}),
+        truncated: false
+      };
+    }
+
+    let page: ReturnType<LocalOperationManager['viewSince']>;
+    try {
+      page = this.operationManager.viewSince(record, typeof input.cursor === 'string' ? input.cursor : undefined);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'invalid operation output cursor';
+      return { ok: false, message: msg, error: { code: 'INVALID_INPUT', message: msg, retryable: false }, truncated: false };
+    }
+    const status = operationStatus(record.status);
+    const error = operationError(record);
+    // Truncated also when the oldest output was dropped (an async command keeps only its newest
+    // maxOutputBytes), so a call without a cursor still learns it saw only the tail.
+    const more = Number(page.cursor) < record.offset + record.output.length;
+    const truncated = page.truncated || record.offset > 0;
+    return {
+      ok: status !== 'failed' && status !== 'cancelled',
+      message: `Operation ${status}`,
+      data: {
+        operationId: record.id,
+        status,
+        kind: record.kind,
+        createdAt: new Date(record.createdAt).toISOString(),
+        deadline: record.startedAt !== undefined && record.timeoutMs ? new Date(record.startedAt + record.timeoutMs).toISOString() : undefined,
+        finishedAt: record.endedAt !== undefined ? new Date(record.endedAt).toISOString() : undefined,
+        ...(status === 'running' ? {} : { result: this.operationResult(record) }),
+        output: page.data.output
+      },
+      ...(error ? { error } : {}),
+      ...(more ? { cursor: page.cursor } : {}),
+      truncated
+    };
+  }
+
+  /** The same data a synchronous call returns; async output keeps the newest maxOutputBytes. */
+  private operationResult(record: ReturnType<LocalOperationManager['operation']>): Record<string, unknown> {
+    return {
+      output: record.output.toString('utf8'),
+      ...(record.exitCode !== undefined ? { exitCode: record.exitCode } : {}),
+      ...(record.signal ? { signal: record.signal } : {}),
+      truncated: record.offset > 0,
+      ...(record.kind === 'bash' ? { target: 'workspace' } : {})
+    };
+  }
+}
+
+type OperationStatus = 'running' | 'completed' | 'failed' | 'cancelled';
+
+function operationStatus(status: string): OperationStatus {
+  if (status === 'succeeded') return 'completed';
+  if (status === 'cancelled') return 'cancelled';
+  if (status === 'running' || status === 'queued') return 'running';
+  return 'failed';
+}
+
+function operationError(record: ReturnType<LocalOperationManager['operation']>): RunnerResponse['error'] | undefined {
+  if (record.status === 'interrupted') {
+    return { code: 'RUNNER_RESTARTED', message: 'the server restarted while this command was running; its output is lost, start it again', retryable: true };
+  }
+  if (record.status === 'cancelled') return { code: 'CANCELLED', message: 'Operation cancelled', retryable: false };
+  if (record.status !== 'failed') return undefined;
+  if (record.timedOut) return { code: 'TIMEOUT', message: 'Command execution exceeded its timeoutMs', retryable: false };
+  const msg = `Command exited with ${record.exitCode ?? 1}`;
+  return { code: 'CONFLICT', message: msg, retryable: false };
 }

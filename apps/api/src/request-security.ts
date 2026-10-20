@@ -59,15 +59,21 @@ function enforceLimit(window: LimitWindow, response: Response, next: NextFunctio
   next();
 }
 
-export function preAuthRequestLimits() {
+/** Requests per rolling minute and concurrent requests one limiter admits. */
+export type RequestLimits = { requestsPerMinute: number; inFlight: number };
+
+const PRE_AUTH_LIMITS: RequestLimits = { requestsPerMinute: 1_000, inFlight: 32 };
+const PRINCIPAL_LIMITS: RequestLimits = { requestsPerMinute: 120, inFlight: 8 };
+
+export function preAuthRequestLimits(limits: RequestLimits = PRE_AUTH_LIMITS) {
   const window: LimitWindow = { startedAt: Date.now(), requests: 0, active: 0, lastSeenAt: Date.now() };
 
   return (_request: Request, response: Response, next: NextFunction): void => {
-    enforceLimit(window, response, next, 1_000, 32);
+    enforceLimit(window, response, next, limits.requestsPerMinute, limits.inFlight);
   };
 }
 
-export function principalRequestLimits(maxPrincipals = 1_000) {
+export function principalRequestLimits(maxPrincipals = 1_000, limits: RequestLimits = PRINCIPAL_LIMITS) {
   const windows = new Map<string, LimitWindow>();
 
   return (request: AuthenticatedRequest, response: Response, next: NextFunction): void => {
@@ -85,7 +91,7 @@ export function principalRequestLimits(maxPrincipals = 1_000) {
       window = { startedAt: Date.now(), requests: 0, active: 0, lastSeenAt: Date.now() };
       windows.set(key, window);
     }
-    enforceLimit(window, response, next, 120, 8);
+    enforceLimit(window, response, next, limits.requestsPerMinute, limits.inFlight);
   };
 }
 

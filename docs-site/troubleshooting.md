@@ -74,6 +74,8 @@ docker compose --profile images build executor-image
 - **`failed to load --workspace-config`:** the file has an unknown field, duplicate key, YAML alias, invalid name, or wrong `version`, or a registered path is missing, not a directory, or nested inside another. Fix the named entry and restart.
 - **`CONFLICT` asking you to pass `workspaceId`:** more than one folder is registered and the call named none. Call `workspace_list` and pass the `workspaceId` on every call (over stdio, `workspace_set_active` can set a default; the local HTTP endpoint rejects it).
 - **Retryable `UNAVAILABLE` or `rootAvailable: false`:** the folder vanished or was replaced since startup, for example a dropped NFS mount. Restore the mount and retry.
+- **`429` or `413` from the local HTTP endpoint:** all clients share the owner limits in `http.limits` (default 600 requests per minute, 32 in flight, 4 MiB per request). Raise them in the config file and restart, and download large files on the server with `exec_run` instead of sending them through `files_write`.
+- **A task shows `interrupted`:** the server restarted while it ran. Only its record survived; run it again with a new `idempotencyKey`.
 - **`local HTTP mode requires MCP_BEARER_TOKEN`:** set a 32-512 character token in `MCP_BEARER_TOKEN` or `MCP_BEARER_TOKEN_FILE`.
 
 See [Several local workspaces from one server](/connect#several-local-workspaces-from-one-server).

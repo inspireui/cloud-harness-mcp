@@ -926,9 +926,9 @@ command, repository, network mode, or workspace changes.
 When running Cloud Harness MCP over local stdio (`--transport stdio --workspace <path>`):
 
 1. **Pre-opened workspace:** The workspace is configured at process startup. Calling `workspace_open` returns `INVALID_INPUT` explaining that the workspace is already selected.
-2. **Lifecycle operations:** `workspace_list` lists the active local workspace. `workspace_status` and `workspace_capabilities` return structured repository and workspace capabilities (`mode: 'local'`, `gitNetwork`, `gitPush`, `sandboxed: false`, granular operations and permissions). `workspace_close` terminates owned child processes but **never deletes the local folder**.
+2. **Lifecycle operations:** `workspace_list` lists the active local workspace. `workspace_status` and `workspace_capabilities` return structured repository and workspace capabilities (`mode: 'local'`, `gitNetwork`, `gitPush`, `sandboxed: false`, granular operations and permissions). `workspace_close` terminates owned child processes but **never deletes the local folder**. Tools local mode cannot serve are not listed; see [Local tool surface](#local-tool-surface).
 3. **Subprocess execution:** `exec_run`, `shell_*`, `sessions_*`, and `tasks_*` execute on the local host with the current user's permissions. Output is bounded by ring buffers and paginated with monotonic cursors.
-4. **Gated capabilities:** `git_fetch` and `git_pull` require `--git-network`. `git_push` requires `--git-push`. `github_action`, `exec_run.privileged=true`, and `bash` with `target: "toolbox"` return structured unsupported errors; `bash` with `target: "workspace"` behaves like `exec_run`.
+4. **Gated capabilities:** `git_fetch` requires `--git-network`. `git_pull` and `git_push` stay behind `--git-network`/`--git-push`, and when allowed point to running `git` through `exec_run`. `github_action`, `exec_run.privileged=true`, and `bash` with `target: "toolbox"` return structured unsupported errors; `bash` with `target: "workspace"` behaves like `exec_run`, including `async: true`.
 5. **Filesystem operations:** File reading, writing, patching, deletion, and searching apply within the canonical workspace root. Traversal escapes are rejected.
 
 ### Local multi-workspace mode
@@ -958,13 +958,104 @@ output never cross roots. The file format and client setup are in the
   symlink, a replaced directory), calls to it return retryable `UNAVAILABLE`
   rather than executing somewhere else. A root check that hangs (a stuck
   hard-mounted export) gives up after a short bound and reports the same, so one
-  stuck mount never blocks the other roots. `workspace_status` and
-  `workspace_close` still work so a client can inspect and stop it; a closed root
-  reports `status: CLOSED` with `workspace_recover` as its next action.
-- **Close and recover.** `workspace_close` stops that root's processes and never
-  touches its files; `workspace_recover` reopens a closed root with the same ID.
-- **Unchanged modes.** Single-root `--workspace` stdio and the remote
-  runner-backed HTTP service behave as before.
+  stuck mount never blocks the other roots. `workspace_status` still works so a
+  client can inspect it; a root stopped by server shutdown reports
+  `status: CLOSED` with `workspace_recover` as its next action.
+- **Shared roots stay open.** Every client of the server shares a registered
+  root, so `workspace_close` is a no-op that reports `shared: true`,
+  `closed: false` and stops no task, shell, session, or operation; the root's
+  `availableActions` omit it. Only server shutdown stops a root's processes,
+  and `workspace_recover` reopens a root stopped that way with the same ID.
+  Refusing while work runs was rejected because an idle close would still break
+  every other client's next call.
+- **Long jobs.** `exec_run` and `bash` with `async: true` return
+  `{ operationId, status: "running" }` like the remote runner, and
+  `operation_status`, `operation_wait` (capped at 300 s per call), and
+  `operation_cancel` resolve that handle in the root that started it. Statuses
+  are `running`, `completed`, `failed`, and `cancelled`; the result is the
+  synchronous call's `data` (`output`, `exitCode`, `truncated`, and for `bash`
+  `target`). An async command keeps its newest `maxOutputBytes` of output
+  instead of stopping at the limit; `truncated` is then `true` both in the
+  result and on the `operation_status` envelope, even without a cursor.
+  `async: true` only frees the call: the command is still bounded by its
+  `timeoutMs` (default 60 s, at most 300 s). `tasks_run` with `tasks_status` is
+  the path for anything longer than 300 s. An `operation_wait` the client
+  aborts answers `CANCELLED`, not `TIMEOUT`, and the command keeps running.
+- **Restarts.** With the registry's `stateDir`, task and operation metadata
+  (ID, key, command, cwd, status, exit code, start and end times; never output)
+  is rewritten atomically on every change. HTTP mode defaults `stateDir` to
+  `~/.local/state/cloud-harness-local`; stdio mode persists only when the file
+  sets it, because every stdio client starts its own process. After a restart,
+  a task that was running or queued reports `interrupted` and an operation
+  reports `failed` with `RUNNER_RESTARTED` instead of `NOT_FOUND`. A `tasks_run`
+  that repeats the key of an interrupted task never re-runs it: it answers
+  `ok: false` with retryable `RUNNER_RESTARTED` and the old `taskId`; retry with
+  a new key.
+- **One process per state file.** Each workspace's state file belongs to one
+  server process, which holds `<file>.lock` (its pid) until shutdown. A second
+  process on the same `stateDir` and workspace (for example a stdio session
+  next to the systemd HTTP service on the same registry) logs one warning and
+  keeps its tasks in memory only, so it never marks the owner's live tasks
+  `interrupted` or overwrites its records. A lock whose pid is gone (a crash) is
+  taken over. Give each server process its own `stateDir`.
+- **Request limits.** `http.limits` sets the owner's `requestsPerMinute`
+  (default 600), `inFlight` (32), and `maxBodyBytes` (4 MiB). Every local
+  client authenticates as the same owner and shares these. Requests without the
+  owner token go through a separate fixed pre-auth window (1000 per minute, 32
+  in flight) that `http.limits` never changes and that never uses the owner's
+  slots.
+- **Files by reference.** `files_import` (local only; the remote server does
+  not list it) downloads files the client passes by reference into a
+  workspace directory, so an image ChatGPT generated or a user uploaded never
+  travels as base64 in a tool call. Its descriptor sets
+  `_meta["openai/fileParams"] = ["files"]` (OpenAI Apps SDK file params), and
+  each `files` entry is `{ download_url, file_id, mime_type?, file_name? }`.
+  Input: `workspaceId`, `dir` (relative to the root or absolute inside it,
+  created when missing, confined like every tool path), `files` (1-16),
+  optional `names` (same order; default the sanitized `file_name`, else
+  `file_id` plus an extension from the MIME type), and `overwrite` (default
+  `false`). Each URL must be `https` (every redirect hop too, at most 5), each
+  download has 60 s and at most `fileImport.maxFileBytes` (default 50 MiB,
+  enforced while streaming), and each file is written to a temporary file and
+  renamed into place. Without `overwrite` an existing name fails with `EXISTS`
+  and is never replaced. Each `data.files[]` entry is either
+  `{ ok: true, path, bytes, sha256, mime, file_id }` (MIME from the PNG, JPEG,
+  WebP, or GIF signature, else the response header, else the client's
+  `mime_type`) or `{ ok: false, error: { code, message, retryable } }` with
+  `INVALID_URL`, `INSECURE_URL`, `HTTP_ERROR`, `TOO_MANY_REDIRECTS`,
+  `NETWORK_ERROR`, `TIMEOUT`, `CANCELLED`, `TOO_LARGE`, `INVALID_NAME`,
+  `DUPLICATE_NAME`, `EXISTS`, or `WRITE_FAILED`. The call is `ok: true` when at
+  least one file was imported (the message names the failures) and `ok: false`
+  only when none was. The download URL is a capability: it is never logged
+  and never appears in a result.
+- **Unchanged modes.** Single-root `--workspace` stdio keeps its
+  close-stops-processes semantics and in-memory tasks, and the remote
+  runner-backed HTTP service behaves as before.
+
+### Local tool surface
+
+Local servers (single-root and multi-root) leave out of `tools/list` every tool
+they cannot serve. Because they are not registered, an MCP `tools/call` that
+names one gets the SDK's protocol error `Tool <name> not found`, not a tool
+result; a client holding a stale cached `tools/list` should reconnect to refresh
+it. The server instructions name the alternatives, and the backend's own
+`INVALID_INPUT` explanation (with the local alternative) is what a direct
+backend caller or a gated tool such as an allowed `git_push` gets. The hidden
+tools are:
+`agent_*` (start a CLI agent with `tasks_run`), `knowledge_*`, `artifacts_*`,
+`packages_*`, model tools, `secrets_list`, `workspace_open`,
+`workspace_finalize`, `git_identity_*`, `skill_suggest`, `git_pull` and
+`git_push` (run `git` through `exec_run`; the `--git-network`/`--git-push`
+gates still answer first when off), `workspace_set_active` except on
+multi-root stdio, and `worktrees_*` when no registered root is inside a Git
+work tree. `github_read` and `github_action` keep their structured
+`REPOSITORY_OPERATION_NOT_AUTHORIZED` error and name the `gh` CLI. Each tool
+call writes one JSON line to stderr with `tool`, `workspaceId`, `durationMs`,
+and `outcome` (plus the error `code`), and never arguments or output. It uses
+the same pino encoding as the server's other log lines (numeric `level`, 30 for
+`ok` and 40 for errors, epoch-millisecond `time`) and honours `LOG_LEVEL`. The list
+is owned by
+[`local-unsupported.ts`](../apps/api/src/local/local-unsupported.ts).
 
 The executable owners are
 [`local-workspace-registry.ts`](../apps/api/src/local/local-workspace-registry.ts),

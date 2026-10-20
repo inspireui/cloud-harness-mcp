@@ -76,7 +76,9 @@ describe('local multi-workspace server (real binary)', () => {
   async function writeConfig(port?: number): Promise<void> {
     const lines = NAMES.map((name) => `  ${name}:\n    path: ${JSON.stringify(join(base, name))}`);
     const http = port ? `http:\n  port: ${port}\n` : '';
-    await writeFile(configPath, `version: 1\n${http}workspaces:\n${lines.join('\n')}\n`);
+    // Keep task state inside the test directory instead of the runner's home.
+    const state = `stateDir: ${JSON.stringify(join(base, 'state'))}\n`;
+    await writeFile(configPath, `version: 1\n${state}${http}workspaces:\n${lines.join('\n')}\n`);
   }
 
   async function connectStdio(): Promise<Client> {
@@ -186,12 +188,48 @@ describe('local multi-workspace server (real binary)', () => {
         await Promise.all(NAMES.map((name, index) => call(index % 2 ? first : second, 'files_write', { workspaceId: ids[index], path: 'http.txt', content: name })));
         for (const name of NAMES) expect(await readFile(join(base, name, 'http.txt'), 'utf8')).toBe(name);
 
-        expect((await call(first, 'workspace_set_active', { workspaceId: ids[0] })).error?.code).toBe('INVALID_INPUT');
+        // Requests share no session, so the HTTP endpoint does not offer workspace_set_active.
+        expect((await first.listTools()).tools.map((tool) => tool.name)).not.toContain('workspace_set_active');
         expect((await call(second, 'files_list', { path: '.' })).error?.code).toBe('CONFLICT');
         expect((await second.callTool({ name: 'files_read', arguments: { workspaceId: ids[0], path: '../bwe/http.txt' } })).isError).toBe(true);
       } finally {
         await first.close();
         await second.close();
+      }
+    });
+
+    it('runs async commands, keeps the workspace open on workspace_close, and reports tasks interrupted by a restart', async () => {
+      const started = await startHttp();
+      const client = await connectHttp(started.url);
+      let taskId: string;
+      let workspaceId: string;
+      try {
+        workspaceId = (await listed(client))[1]!.workspaceId;
+        const tools = (await client.listTools()).tools.map((tool) => tool.name);
+        expect(tools).toContain('operation_wait');
+        expect(tools).not.toContain('agent_spawn');
+
+        const asyncRun = await call(client, 'exec_run', { workspaceId, command: 'echo async-http', async: true });
+        const waited = await call(client, 'operation_wait', { operationId: asyncRun.data!.operationId, timeoutMs: 10_000 });
+        expect(waited.ok).toBe(true);
+        expect(String((waited.data!.result as { output: string }).output)).toContain('async-http');
+
+        const task = await call(client, 'tasks_run', { workspaceId, command: 'sleep 60', idempotencyKey: 'http-restart-1', timeoutMs: 120_000 });
+        taskId = String(task.data!.taskId);
+        expect((await call(client, 'workspace_close', { workspaceId })).data).toMatchObject({ shared: true, closed: false });
+        expect((await call(client, 'tasks_status', { workspaceId, taskId })).data).toMatchObject({ status: 'running' });
+      } finally {
+        await client.close();
+      }
+
+      started.child.kill('SIGTERM');
+      await new Promise((r) => started.child.once('exit', r));
+      const restarted = await startHttp();
+      const after = await connectHttp(restarted.url);
+      try {
+        expect((await call(after, 'tasks_status', { workspaceId, taskId })).data).toMatchObject({ id: taskId, status: 'interrupted' });
+      } finally {
+        await after.close();
       }
     });
   });

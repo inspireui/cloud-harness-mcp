@@ -62,15 +62,15 @@ describe('MCP stdio real binary interoperability', () => {
 
     await client.connect(transport);
 
-    // List tools
+    // List tools: local mode leaves out the tools it cannot serve.
     const tools = await client.listTools();
-    expect(tools.tools).toHaveLength(TOOL_SPECS.length);
+    const names = tools.tools.map((t) => t.name);
+    expect(names.length).toBeLessThan(TOOL_SPECS.length);
+    for (const hidden of ['github_action', 'agent_spawn', 'knowledge_list', 'workspace_open', 'worktrees_create']) expect(names).not.toContain(hidden);
+    for (const listed of ['exec_run', 'tasks_run', 'operation_wait']) expect(names).toContain(listed);
 
     const closeTool = tools.tools.find((t) => t.name === 'workspace_close');
     expect(closeTool?.annotations?.destructiveHint).toBe(true);
-    const ghActionTool = tools.tools.find((t) => t.name === 'github_action');
-    expect(ghActionTool).toBeDefined();
-    expect(ghActionTool?.annotations?.destructiveHint).toBe(true);
     // List workspaces (should have 1 pre-opened local workspace)
     const listResult = await client.callTool({ name: 'workspace_list', arguments: {} });
     expect(listResult.isError).toBe(false);
@@ -113,17 +113,13 @@ describe('MCP stdio real binary interoperability', () => {
     });
     expect(execResult.isError).toBe(false);
 
-    // Verify github_action returns structured unsupported error in local mode
-    const ghActionCall = await client.callTool({
-      name: 'github_action',
-      arguments: {
-        workspaceId,
-        action: 'pr_list'
-      }
-    });
-    expect(ghActionCall.isError).toBe(true);
-    expect((ghActionCall.structuredContent as Record<string, any>).error.code).toBe('REPOSITORY_OPERATION_NOT_AUTHORIZED');
-    expect((ghActionCall.structuredContent as Record<string, any>).error.operation).toBe('github_action');
+    // An async command returns an operation handle that operation_wait resolves.
+    const asyncResult = await client.callTool({ name: 'exec_run', arguments: { workspaceId, command: 'echo async-ok', async: true } });
+    const operationId = (asyncResult.structuredContent as { data: { operationId: string } }).data.operationId;
+    const waited = await client.callTool({ name: 'operation_wait', arguments: { operationId, timeoutMs: 10_000 } });
+    expect(waited.isError).toBe(false);
+    expect((waited.structuredContent as { data: { result: { output: string } } }).data.result.output).toContain('async-ok');
+
 
     // Close the workspace
     const closeResult = await client.callTool({
@@ -159,7 +155,8 @@ describe('MCP stdio real binary interoperability', () => {
     await client.connect(transport);
 
     const tools = await client.listTools();
-    expect(tools.tools).toHaveLength(TOOL_SPECS.length);
+    expect(tools.tools.map((t) => t.name)).toContain('workspace_list');
+    expect(tools.tools.length).toBeLessThan(TOOL_SPECS.length);
 
     const listResult = await client.callTool({ name: 'workspace_list', arguments: {} });
     expect(listResult.isError).toBe(false);

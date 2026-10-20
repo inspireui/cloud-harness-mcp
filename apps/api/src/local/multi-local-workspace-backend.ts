@@ -1,9 +1,13 @@
 import { realpath, stat } from 'node:fs/promises';
-import { isModelToolOperation, type RunnerOperation, type RunnerResponse } from '@cloud-harness/contracts';
-import type { OperationBackend } from '../operation-backend.js';
+import type { RunnerOperation, RunnerResponse } from '@cloud-harness/contracts';
+import type { BackendTool, OperationBackend } from '../operation-backend.js';
 import type { CliOptions } from '../cli-options.js';
-import { LocalWorkspaceBackend } from './local-workspace-backend.js';
+import { LOCAL_LONG_JOB_GUIDANCE, LOCAL_REGISTERED_GUIDANCE, LocalWorkspaceBackend } from './local-workspace-backend.js';
 import type { RegisteredLocalWorkspace } from './local-workspace-registry.js';
+import { LocalTaskStateFile } from './local-task-state.js';
+import { logLocalToolCall } from './local-call-log.js';
+import { FILES_IMPORT_TOOL_SPEC, LOCAL_FILE_IMPORT_GUIDANCE, defaultFileImportSettings, type FileImportSettings } from './local-file-import.js';
+import { isLocalToolAdvertised, unsupportedLocalReason, unsupportedLocalResponse } from './local-unsupported.js';
 
 type Member = {
   entry: RegisteredLocalWorkspace;
@@ -17,6 +21,11 @@ const WORKSPACELESS_OPERATIONS = new Set<RunnerOperation>([
   'artifacts_list', 'artifacts_read', 'artifacts_delete'
 ]);
 
+const OPERATION_HANDLE_TOOLS = new Set<RunnerOperation>(['operation_status', 'operation_cancel', 'operation_wait']);
+
+const REGISTERED_CLOSE_DESCRIPTION = 'Registered local workspaces are shared by every client of this server, so this is a no-op: '
+  + 'it never stops tasks, shells, sessions, or async commands and never touches files. Stop your own work with tasks_cancel, shell_close, sessions_close, or operation_cancel.';
+
 /**
  * A hard-mounted network export can hang `stat` indefinitely. The check gives up after this long
  * and reports the root unavailable, so one stuck mount never blocks the other workspaces. The
@@ -26,7 +35,7 @@ const WORKSPACELESS_OPERATIONS = new Set<RunnerOperation>([
 const ROOT_CHECK_TIMEOUT_MS = 2_000;
 
 /** Lifecycle tools that must reach a workspace even when its root is unavailable. */
-const ROOT_INDEPENDENT_OPERATIONS = new Set<RunnerOperation>(['workspace_status', 'workspace_close']);
+const ROOT_INDEPENDENT_OPERATIONS = new Set<RunnerOperation>(['workspace_status']);
 
 function failure(code: 'NOT_FOUND' | 'CONFLICT' | 'INVALID_INPUT' | 'UNAVAILABLE', message: string, retryable = false): RunnerResponse {
   return { ok: false, message, error: { code, message, retryable }, truncated: false };
@@ -35,15 +44,22 @@ function failure(code: 'NOT_FOUND' | 'CONFLICT' | 'INVALID_INPUT' | 'UNAVAILABLE
 /**
  * Owns one single-root `LocalWorkspaceBackend` per operator-registered root. Every member keeps
  * its own path policy, worker, and process manager, so tasks, shells, sessions, and outputs never
- * cross workspaces. Closing a member stops its processes and never touches the project directory.
+ * cross workspaces. Clients cannot close a member (workspace_close is a no-op because every client
+ * shares it); only server shutdown stops its processes, and nothing ever touches the project directory.
  */
 export class LocalWorkspacePool {
   private readonly members = new Map<string, Member>();
 
+  /**
+   * `stateDir`, when set, keeps each member's task and async-operation metadata in
+   * `<stateDir>/tasks/<workspaceId>.json`, so a restart reports earlier handles as interrupted.
+   */
   constructor(
     registry: RegisteredLocalWorkspace[],
     options: CliOptions,
-    private readonly workerScriptPath?: string
+    private readonly workerScriptPath?: string,
+    private readonly stateDir?: string,
+    private readonly fileImport: FileImportSettings = defaultFileImportSettings()
   ) {
     for (const entry of registry) {
       const gitPush = entry.gitPush ?? options.gitPush;
@@ -51,9 +67,27 @@ export class LocalWorkspacePool {
       this.members.set(entry.workspaceId, {
         entry,
         options: memberOptions,
-        backend: new LocalWorkspaceBackend(entry.canonicalRoot, memberOptions, workerScriptPath, entry.workspaceId)
+        backend: this.createBackend(entry, memberOptions)
       });
     }
+  }
+
+  private createBackend(entry: RegisteredLocalWorkspace, options: CliOptions): LocalWorkspaceBackend {
+    const stateFile = this.stateDir ? LocalTaskStateFile.forWorkspace(this.stateDir, entry.workspaceId) : undefined;
+    const backend = new LocalWorkspaceBackend(entry.canonicalRoot, options, this.workerScriptPath, entry.workspaceId, stateFile);
+    backend.registered = true;
+    backend.fileImport = this.fileImport;
+    return backend;
+  }
+
+  /** True when any registered root is inside a Git work tree; each member caches its own answer. */
+  get anyGitRoot(): boolean {
+    return this.list().some((member) => member.backend.gitRoot);
+  }
+
+  /** The member that owns an async exec_run/bash operation handle, if any. */
+  ownerOfOperation(operationId: string): Member | undefined {
+    return this.list().find((member) => member.backend.hasOperation(operationId));
   }
 
   list(): Member[] {
@@ -74,7 +108,7 @@ export class LocalWorkspacePool {
     if (current.backend !== member.backend || !current.backend.closed) return current;
     const next: Member = {
       ...member,
-      backend: new LocalWorkspaceBackend(member.entry.canonicalRoot, member.options, this.workerScriptPath, member.entry.workspaceId)
+      backend: this.createBackend(member.entry, member.options)
     };
     this.members.set(member.entry.workspaceId, next);
     return next;
@@ -109,8 +143,9 @@ export class LocalWorkspacePool {
     }
   }
 
+  /** Server shutdown: stops every member's processes and saves their tasks as interrupted. */
   async close(): Promise<void> {
-    await Promise.allSettled(this.list().map((member) => member.backend.close()));
+    await Promise.allSettled(this.list().map((member) => member.backend.shutdown()));
   }
 }
 
@@ -138,7 +173,37 @@ export class MultiLocalWorkspaceBackend implements OperationBackend {
       : 'Pass workspaceId on each call; this endpoint does not keep an active-workspace default.';
     return `This is a Cloud Harness local multi-workspace server. Registered persistent workspaces are already open: ${names}. `
       + `Call workspace_list to see their status. ${selection} `
-      + 'Operations execute in the selected project folder with host-user permissions. Path confinement prevents tool path escapes; commands run with host authority.';
+      + 'Operations execute in the selected project folder with host-user permissions. Path confinement prevents tool path escapes; commands run with host authority. '
+      + LOCAL_REGISTERED_GUIDANCE + LOCAL_FILE_IMPORT_GUIDANCE + LOCAL_LONG_JOB_GUIDANCE;
+  }
+
+  supportsOperation(operation: RunnerOperation): boolean {
+    return isLocalToolAdvertised(operation, { selection: this.selection, anyGitRoot: this.pool.anyGitRoot });
+  }
+
+  describeOperation(operation: RunnerOperation): string | undefined {
+    return operation === 'workspace_close' ? REGISTERED_CLOSE_DESCRIPTION : undefined;
+  }
+
+  backendTools(): BackendTool[] {
+    return [FILES_IMPORT_TOOL_SPEC];
+  }
+
+  /** Backend tools carry a workspaceId and run in that member, after the same root check as runner tools. */
+  async callBackendTool(name: string, input: Record<string, unknown>, signal?: AbortSignal): Promise<RunnerResponse> {
+    const selected = this.selectMember(input);
+    if ('failure' in selected) return selected.failure;
+    let member = selected.member;
+    if (!(await this.pool.rootAvailable(member))) {
+      return failure('UNAVAILABLE', `workspace "${member.entry.name}" root ${member.entry.configuredPath} is unavailable or no longer the registered directory; restore the mount, then retry`, true);
+    }
+    member = this.pool.get(member.entry.workspaceId)!;
+    return await member.backend.callBackendTool(name, { ...input, workspaceId: member.entry.workspaceId }, signal);
+  }
+
+  logToolCall(operation: RunnerOperation | string, input: Record<string, unknown>, durationMs: number, response?: RunnerResponse): void {
+    const workspaceId = typeof input.workspaceId === 'string' ? input.workspaceId : this.resolveDefault()?.entry.workspaceId;
+    logLocalToolCall(operation, workspaceId, durationMs, response);
   }
 
   async call(operation: RunnerOperation, input: Record<string, unknown>, signal?: AbortSignal): Promise<RunnerResponse> {
@@ -148,20 +213,37 @@ export class MultiLocalWorkspaceBackend implements OperationBackend {
     }
     if (operation === 'workspace_set_active') return await this.setActive(input);
 
-    // The toolbox target, managed packages, and model tools need the remote runner; any member refuses
-    // them with the local-mode explanation, even when a packages_* call names a workspace.
-    if (WORKSPACELESS_OPERATIONS.has(operation) || (operation === 'bash' && input.target === 'toolbox') || operation.startsWith('packages_')
-      || isModelToolOperation(operation)) {
+    // Remote-only tools are refused before routing, so a tool without a workspaceId never reports a
+    // selection CONFLICT. GitHub tools keep their structured per-workspace capability error.
+    const unsupported = operation === 'github_read' || operation === 'github_action' ? undefined : unsupportedLocalReason(operation);
+    if (unsupported) return unsupportedLocalResponse(operation, unsupported);
+
+    // An operation handle belongs to the member that started it; it is never guessed from a default.
+    if (OPERATION_HANDLE_TOOLS.has(operation)) {
+      const owner = this.pool.ownerOfOperation(String(input.operationId ?? ''));
+      if (!owner) return failure('NOT_FOUND', `operation ${String(input.operationId ?? '')} not found`);
+      return await owner.backend.call(operation, input, signal);
+    }
+
+    // The toolbox target needs the remote runner; any member refuses it with the local-mode explanation.
+    if (WORKSPACELESS_OPERATIONS.has(operation) || (operation === 'bash' && input.target === 'toolbox')) {
       const member = this.resolveDefault() ?? this.pool.list()[0]!;
       return await member.backend.call(operation, input, signal);
     }
 
-    const requested = typeof input.workspaceId === 'string' ? input.workspaceId : undefined;
-    let member = requested !== undefined ? this.pool.get(requested) : this.resolveDefault();
-    if (!member) {
-      if (requested !== undefined) return failure('NOT_FOUND', 'workspace not found');
-      const names = this.pool.list().map((m) => `${m.entry.name}=${m.entry.workspaceId}`).join(', ');
-      return failure('CONFLICT', `more than one local workspace is registered; pass workspaceId explicitly (${names})`);
+    const selected = this.selectMember(input);
+    if ('failure' in selected) return selected.failure;
+    let member = selected.member;
+
+    if (operation === 'workspace_close') {
+      // Every client of this server shares a registered root, so closing it would kill other
+      // clients' tasks, shells, and sessions. It stays open; only the operator's shutdown stops it.
+      return {
+        ok: true,
+        message: `Workspace "${member.entry.name}" is operator-registered and shared, so workspace_close left it open and stopped nothing; cancel your own tasks, shells, sessions, or operations instead`,
+        data: { workspaceId: member.entry.workspaceId, status: member.backend.closed ? 'CLOSED' : 'ACTIVE', shared: true, closed: false },
+        truncated: false
+      };
     }
 
     if (!ROOT_INDEPENDENT_OPERATIONS.has(operation) && !(await this.pool.rootAvailable(member))) {
@@ -179,11 +261,17 @@ export class MultiLocalWorkspaceBackend implements OperationBackend {
       member = this.pool.reopen(member);
     }
 
-    const response = await member.backend.call(operation, { ...input, workspaceId: member.entry.workspaceId }, signal);
-    if (operation === 'workspace_close' && response.ok && this.activeWorkspaceId === member.entry.workspaceId) {
-      this.activeWorkspaceId = undefined;
-    }
-    return response;
+    return await member.backend.call(operation, { ...input, workspaceId: member.entry.workspaceId }, signal);
+  }
+
+  /** The explicitly requested member, else the default; never a guess between several. */
+  private selectMember(input: Record<string, unknown>): { member: Member } | { failure: RunnerResponse } {
+    const requested = typeof input.workspaceId === 'string' ? input.workspaceId : undefined;
+    const member = requested !== undefined ? this.pool.get(requested) : this.resolveDefault();
+    if (member) return { member };
+    if (requested !== undefined) return { failure: failure('NOT_FOUND', 'workspace not found') };
+    const names = this.pool.list().map((m) => `${m.entry.name}=${m.entry.workspaceId}`).join(', ');
+    return { failure: failure('CONFLICT', `more than one local workspace is registered; pass workspaceId explicitly (${names})`) };
   }
 
   private resolveDefault(): Member | undefined {
@@ -199,6 +287,7 @@ export class MultiLocalWorkspaceBackend implements OperationBackend {
     const record = member.backend.getPublicRecord();
     return {
       ...record,
+      shared: true,
       name: member.entry.name,
       root: member.entry.canonicalRoot,
       rootAvailable: await this.pool.rootAvailable(member),

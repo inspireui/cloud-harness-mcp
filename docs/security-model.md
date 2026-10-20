@@ -909,7 +909,35 @@ never for mutually untrusted users.
   ([`request-security.ts`](../apps/api/src/request-security.ts)), binds to
   loopback by default, and keeps no shared active-workspace state between
   requests. Binding it to a non-loopback address exposes host-user execution to
-  anyone holding the token.
+  anyone holding the token. Its per-owner limits and body size come from
+  `http.limits` in the registry, with higher defaults than the remote API
+  because every local client is the one owner. `http.limits` applies only to
+  requests that carry the owner token: every other request goes through a
+  separate fixed pre-auth window (1000 per minute, 32 in flight) before it is
+  refused, so raising the owner limits never widens what unauthenticated
+  traffic gets, and unauthenticated traffic never takes the owner's slots.
+- Clients share every registered root, so `workspace_close` cannot stop another
+  client's processes: it is a no-op on a registered root.
+- Task and async-operation metadata, including the command text, is saved under
+  the registry's `stateDir` with owner-only permissions (directory `0700`, file
+  `0600`) so a restart can report interrupted work. One server process owns
+  each workspace's file through an exclusive `<file>.lock` holding its pid;
+  another process on the same `stateDir` runs without persistence instead of
+  overwriting it. Output is never saved. A
+  command that carries a secret on its command line therefore lands in that
+  file; pass secrets through forwarded environment variables instead.
+- The per-call log line on stderr carries the tool, workspace, duration, and
+  outcome only, never arguments or output.
+- `files_import` (local only) makes the server fetch client-supplied URLs.
+  Only `https` is accepted, on every redirect hop (at most 5); plain `http` is
+  refused unless `CLOUD_HARNESS_FILE_IMPORT_ALLOW_LOOPBACK_HTTP=1` is set, and
+  then only for `127.0.0.1`, `::1`, or `localhost` (tests). Downloads are
+  capped by `fileImport.maxFileBytes` while streaming and by a 60 s deadline,
+  land in a destination confined like every tool path, and are renamed into
+  place, replacing a symlink at the final name rather than following it. The
+  download URL is a bearer capability: it is never logged, stored, or echoed in
+  a result or error. The owner token already grants host execution, so the
+  fetch adds no authority beyond it; it does not block private HTTPS addresses.
 
 ## Repository capability introspection and authorization preflight
 

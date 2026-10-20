@@ -128,7 +128,12 @@ poll `tasks_status`, `operation_wait`, or `agent_status` instead.
    multi-workspace server"), workspaces are already open and `workspace_open`
    is refused: call `workspace_list`, choose by `name`/`root`, and pass that
    `workspaceId` on every call. The local HTTP endpoint rejects
-   `workspace_set_active`. A retryable `UNAVAILABLE` or `rootAvailable: false`
+   `workspace_set_active`. Never close a registered local workspace when
+   finished. Run anything longer than 300 s with `tasks_run`; `async: true`
+   plus `operation_wait` only frees the call for a command of up to 300 s.
+   Local servers list only the tools they can serve. To hand a local server an
+   image you generated or the user uploaded, call `files_import` with the image
+   as a file; never paste base64. A retryable `UNAVAILABLE` or `rootAvailable: false`
    means the folder's mount is gone; stop and report rather than retrying in a
    loop. Details:
    [Workspace lifecycle](references/workspace-lifecycle-and-results.md#local-workspaces).

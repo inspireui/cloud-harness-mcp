@@ -572,7 +572,13 @@ integration.
 
 `--workspace-config` reads an operator-owned, versioned YAML or JSON file that
 names each local root, optional per-root Git network/push overrides of the CLI
-flags, and optional local HTTP bind settings. It is parsed strictly (unknown
+flags, optional local HTTP bind settings and request limits (`http.limits`),
+an optional `stateDir` for task metadata that survives restarts (HTTP
+mode defaults it to `~/.local/state/cloud-harness-local`; stdio mode persists
+only when it is set; one server process owns each state file), and an optional
+`fileImport.maxFileBytes` cap for each `files_import` download (default 50 MiB).
+It is
+parsed strictly (unknown
 fields, duplicate keys, and aliases are errors) and every root is validated at
 startup, because a typo must stop the server rather than silently expose or
 drop a directory. Registration is file-only by design: no tool can change the
